@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TSP for Engineers — Mirendil AI Lab Course</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="hero">
+        <div class="eyebrow">Mirendil AI Lab · concept course</div>
+        <h1>Tensor-Sequence Parallelism,<br>explained for software engineers</h1>
+        <p class="lede">You're a full-stack engineer, not a data scientist. This course rebuilds every idea in the mirendil test from the ground up — slowly, concretely, and shape-first — until TP, SP, and TSP feel obvious.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">What this course is about</span>
+        <p>The test is a <strong>reproduction study</strong> of a research paper on <strong>Tensor-Sequence Parallelism (TSP)</strong>. The goal: run a transformer's attention and MLP across <strong>8 GPUs</strong> so that no single GPU runs out of memory, and measure whether the clever combined strategy (TSP) really beats the simpler ones (TP, SP).</p>
+        <p>Every module ends with <em>check-your-understanding</em> toggles. There's an interactive <strong>shape calculator</strong> in modules 5–7 so you can play with the tensor shapes yourself.</p>
+      </div>
+
+      <h2 style="border:none">The path</h2>
+      <div class="module-cards">
+        <a class="module-card" href="01-big-picture.html">
+          <span class="mnum">MODULE 01</span>
+          <div class="mttl">The big picture</div>
+          <p class="mdesc">Why we split models across GPUs at all. The two kinds of memory pressure — weights vs. activations — and the three strategies that attack them.</p>
+        </a>
+        <a class="module-card" href="02-transformers.html">
+          <span class="mnum">MODULE 02</span>
+          <div class="mttl">How a transformer computes</div>
+          <p class="mdesc">Start here. What a transformer actually does to your text, step by step — embeddings, the residual stream, layers — and exactly which numbers are <em>weights</em> and which are <em>activations</em>. The foundation for everything else.</p>
+        </a>
+        <a class="module-card" href="03-attention-refresher.html">
+          <span class="mnum">MODULE 03</span>
+          <div class="mttl">Attention & the transformer block</div>
+          <p class="mdesc">A no-heavy-math refresher: B, S, H, heads, head_dim, the Q/K/V/O projections, the MLP, and the one matrix convention you must internalize.</p>
+        </a>
+        <a class="module-card" href="04-multi-gpu-primitives.html">
+          <span class="mnum">MODULE 04</span>
+          <div class="mttl">Multi-GPU primitives</div>
+          <p class="mdesc">torchrun, ranks, and the three collective operations — broadcast, all_reduce, all_gather — that everything else is built from.</p>
+        </a>
+        <a class="module-card" href="05-tensor-parallelism.html">
+          <span class="mnum">MODULE 05</span>
+          <div class="mttl">Tensor parallelism (TP)</div>
+          <p class="mdesc">Sharding attention heads. Column-parallel vs row-parallel. Why the output projection needs an all_reduce. The insight people always trip on.</p>
+        </a>
+        <a class="module-card" href="06-sequence-parallelism.html">
+          <span class="mnum">MODULE 06</span>
+          <div class="mttl">Sequence parallelism (SP)</div>
+          <p class="mdesc">Sharding tokens instead of heads. Why attention suddenly needs to gather K/V from everyone. Causal load imbalance and the zigzag fix.</p>
+        </a>
+        <a class="module-card" href="07-tensor-sequence-parallelism.html">
+          <span class="mnum">MODULE 07</span>
+          <div class="mttl">Tensor-sequence parallelism (TSP)</div>
+          <p class="mdesc">Folding both axes onto one set of GPUs. The "diagonal grid" problem, the loop over weight shards, and Algorithm 1 line by line.</p>
+        </a>
+        <a class="module-card" href="08-tradeoffs.html">
+          <span class="mnum">MODULE 08</span>
+          <div class="mttl">Tradeoffs & when to use what</div>
+          <p class="mdesc">Memory scaling (1/T, 1/Σ, 1/D), communication cost, and the honest answer to "is TSP just better?" — read against the real benchmark numbers.</p>
+        </a>
+        <a class="module-card" href="09-profiling-validation.html">
+          <span class="mnum">MODULE 09</span>
+          <div class="mttl">Profiling & validation</div>
+          <p class="mdesc">How you actually measure peak memory and latency on 8×H100, and the reference-output trick that proves a parallel implementation is correct.</p>
+        </a>
+        <a class="module-card" href="10-glossary.html">
+          <span class="mnum">MODULE 10</span>
+          <div class="mttl">Glossary & cheat sheet</div>
+          <p class="mdesc">Every symbol, every collective, every shape in one place. Keep this open while you read the actual code in the repo.</p>
+        </a>
+      </div>
+
+      <div class="callout analogy" style="margin-top:32px">
+        <span class="label">How to use this</span>
+        <p>Read in order — each module assumes the previous one. When a module references a file like <code>tensor_parallelism.py</code>, that's real code sitting next to this course in the repo; open it side by side once you've read the concept. You don't need a GPU to follow along.</p>
+      </div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

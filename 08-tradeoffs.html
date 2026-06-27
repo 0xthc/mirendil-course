@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · Tradeoffs & when to use what</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 08</div>
+      <h1>Tradeoffs &amp; when to use what</h1>
+      <p class="lede">Now the engineering judgment. We'll reason about memory scaling first, then read the test's actual numbers — which tell an honest, non-obvious story.</p>
+
+      <h2>Memory scaling, as formulas</h2>
+      <p>Let <code>D</code> be your total GPU count. The two memory categories from module 1 scale differently under each strategy:</p>
+      <table>
+        <thead><tr><th>Strategy</th><th>Model-state memory</th><th>Activation memory</th></tr></thead>
+        <tbody>
+          <tr><td><strong>TP</strong></td><td><code>1/D</code> ✅ (weights sharded)</td><td><code>1</code> ❌ (full sequence replicated)</td></tr>
+          <tr><td><strong>SP</strong></td><td><code>1</code> ❌ (weights replicated)</td><td><code>1/D</code> ✅ (tokens sharded)</td></tr>
+          <tr><td><strong>TP + SP</strong></td><td><code>1/T</code></td><td><code>1/Σ</code> &nbsp;(with <code>T·Σ = D</code>)</td></tr>
+          <tr><td><strong>TSP</strong></td><td><code>≈ 1/D</code> ✅</td><td><code>≈ 1/D</code> ✅</td></tr>
+        </tbody>
+      </table>
+
+      <p>The <strong>TP+SP</strong> row is the key comparison. With a fixed budget of <code>D</code> GPUs you must <em>split</em> them between the two axes: <code>D = T · Σ</code>. Spend more on <code>T</code> and you shrink weights more but activations less; spend more on <code>Σ</code> and vice versa. You can't max both — the product is fixed. For <code>D=8</code> you might pick <code>T=4, Σ=2</code> (weights ÷4, activations ÷2) or <code>T=2, Σ=4</code> (weights ÷2, activations ÷4), but never ÷8 on both.</p>
+
+      <div class="callout key">
+        <span class="label">TSP's theoretical pitch</span>
+        <p>TSP folds both reductions onto the <em>same</em> axis of size <code>D</code>, aiming for <strong>both</strong> memory classes to scale as <code>≈1/D</code> simultaneously — the thing TP+SP structurally cannot do with one GPU budget. That's the promise. The catch is communication.</p>
+      </div>
+
+      <h2>The cost side: communication</h2>
+      <p>Memory savings are never free. Each strategy pays a different communication tax:</p>
+      <ul>
+        <li><strong>TP:</strong> one <code>all_reduce</code> of a <span class="shape">[B, S, H]</span> tensor per attention (and per MLP). Cheap-ish, end of layer.</li>
+        <li><strong>SP:</strong> <code>all_gather</code> of K and V every attention. Grows with sequence length.</li>
+        <li><strong>TSP:</strong> the most. It <code>broadcast</code>s weight shards <em>during the forward pass</em> <strong>and</strong> <code>all_gather</code>s K/V — once per loop iteration over <code>D</code> shards. Weight traffic + K/V traffic.</li>
+      </ul>
+      <p>So TSP buys the best memory profile by paying the most data movement. Whether that's a good trade depends entirely on whether the extra traffic rides fast links (NVLink) and can be <em>overlapped</em> with compute. The test's implementation did <strong>not</strong> overlap it — so its TSP timings are a pessimistic view.</p>
+
+      <h2>What the test actually measured</h2>
+      <p>From <code>report.md</code>: 8× H100, batch 8, hidden 2K, sweeping sequence length. Here's the peak-memory story for the attention region (lower is better):</p>
+      <table>
+        <thead><tr><th>Seq len</th><th>TP peak</th><th>SP peak</th><th>TSP peak</th></tr></thead>
+        <tbody>
+          <tr><td>8K</td><td>1.85 GiB</td><td>2.84 GiB</td><td><strong>1.58 GiB</strong></td></tr>
+          <tr><td>16K</td><td>3.60 GiB</td><td>5.59 GiB</td><td><strong>3.07 GiB</strong></td></tr>
+          <tr><td>32K</td><td>7.10 GiB</td><td>11.09 GiB</td><td><strong>6.14 GiB</strong></td></tr>
+          <tr><td>64K</td><td>14.10 GiB</td><td>22.09 GiB</td><td><strong>13.42 GiB</strong></td></tr>
+        </tbody>
+      </table>
+      <p><strong>TSP wins on peak memory at every size</strong> — exactly the paper's claim. Two more things jump out:</p>
+      <ul>
+        <li><strong>SP uses the <em>most</em> memory</strong>, not the least. Counterintuitive! The cause is the implementation choice flagged in the report: SP gathers the <em>full</em> K/V sequence onto every rank (<code>all_gather</code>), so each GPU temporarily holds the entire sequence's keys and values — a big buffer. The report names the fix as future work: <em>ring-attention</em>, which streams K/V instead of materializing all of it.</li>
+        <li>The memory advantage of TSP over TP is modest at long sequences (13.42 vs 14.10 GiB at 64K) — because at long context, activations dominate and TSP's edge is mostly on the weight side.</li>
+      </ul>
+
+      <h3>Now the runtime story (lower is better)</h3>
+      <table>
+        <thead><tr><th>Seq len</th><th>Heads</th><th>TP</th><th>SP</th><th>TSP</th></tr></thead>
+        <tbody>
+          <tr><td>8K</td><td>16</td><td><strong>19 ms</strong></td><td>61 ms</td><td>35 ms</td></tr>
+          <tr><td>16K</td><td>16</td><td><strong>53 ms</strong></td><td>149 ms</td><td>123 ms</td></tr>
+          <tr><td>32K</td><td>16</td><td><strong>139 ms</strong></td><td>450 ms</td><td>285 ms</td></tr>
+          <tr><td>64K</td><td>32</td><td><strong>583 ms</strong></td><td>1733 ms</td><td>1893 ms</td></tr>
+        </tbody>
+      </table>
+      <p><strong>TP is consistently the fastest.</strong> It does the least communication and keeps full compute parallelism. TSP and SP are much slower because of their gather/broadcast traffic — and TSP's un-overlapped weight broadcasts make it the slowest at the largest size. This is the honest tradeoff in one picture: <strong>TSP buys the lowest memory and pays for it in time.</strong></p>
+
+      <div class="callout warn">
+        <span class="label">Read benchmarks like an engineer</span>
+        <p>These TSP numbers are a <em>floor</em>, not a verdict. The report explicitly lists the optimizations it skipped: async overlap of weight movement, keeping shards resident instead of re-broadcasting, ring-attention for K/V. Each would narrow the runtime gap. The memory win, though, is structural and real regardless. When you evaluate a parallelism strategy, always ask "is this slowness fundamental or just un-optimized?"</p>
+      </div>
+
+      <h2>The decision guide</h2>
+      <table>
+        <thead><tr><th>Use…</th><th>When…</th></tr></thead>
+        <tbody>
+          <tr><td><strong>TP</strong></td><td>Sequence/activations fit fine and you only need to shrink the <em>weights</em>; you want the fastest option. Great default for moderate context.</td></tr>
+          <tr><td><strong>SP</strong></td><td>Weights fit fine but the <em>sequence</em> is huge; activation memory is your wall. (Pair with ring-attention to avoid the K/V-gather blowup this test saw.)</td></tr>
+          <tr><td><strong>TP + SP</strong></td><td>You want independent control over the two reductions and have enough GPUs to spend a 2D grid; or TSP's weight movement can't be hidden on your hardware.</td></tr>
+          <tr><td><strong>TSP</strong></td><td>Memory is <em>the</em> bottleneck, context/batch is large, you want both reductions on one GPU budget, and the extra weight traffic stays on fast links or overlaps with compute.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout key">
+        <span class="label">The one-sentence takeaway</span>
+        <p>TSP is not "strictly better" — it's the right tool when <strong>memory is the binding constraint and you can hide the communication</strong>. TP wins on speed; SP targets activations specifically; TP+SP gives you a tuning dial; TSP is the memory specialist.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>With D=8 GPUs and TP+SP, can you get both weights and activations down to 1/8? Why is TSP different?</summary>
+        <div class="answer">
+          <p>No. TP+SP must split the budget: <code>T·Σ=8</code>. Weights scale as <code>1/T</code>, activations as <code>1/Σ</code>, and the product of the divisors is capped at 8 — e.g. ÷4 and ÷2, or ÷2 and ÷4, never ÷8 and ÷8. TSP folds both onto the same axis of size 8, so both target <code>≈1/8</code> at once. That simultaneous reduction on one GPU budget is exactly what TSP exists to provide.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>The test found SP used the MOST peak memory. Isn't SP supposed to save memory? What happened?</summary>
+        <div class="answer">
+          <p>SP does shrink the per-rank <em>input</em> activations, but this implementation's attention <code>all_gather</code>s the full K/V sequence onto every rank — so each GPU briefly materializes the entire sequence's keys and values, a large buffer that dominates peak memory. It's an implementation artifact, not a flaw in the SP idea. The fix named in the report is <strong>ring-attention</strong>, which streams K/V in chunks instead of gathering all of it at once.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>TSP had the lowest memory but among the slowest runtimes. Is that a reason to reject TSP?</summary>
+        <div class="answer">
+          <p>Not necessarily. The memory win is structural and real. The slowness is largely <em>un-optimized</em> communication: this implementation re-broadcasts weight shards every forward pass with no overlap, and gathers K/V fully. The report lists concrete fixes (async overlap, resident shards, ring-attention) that would shrink the runtime gap. The engineering question is always "is the cost fundamental or fixable?" — here, much of it is fixable, so TSP stays attractive when memory is the real constraint.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

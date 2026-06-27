@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>07 · Tensor-sequence parallelism (TSP)</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 07</div>
+      <h1>Tensor-sequence parallelism (TSP)</h1>
+      <p class="lede">The paper's contribution and the heart of the test. Fold <em>both</em> the weight split and the token split onto the <em>same</em> GPUs, so a single 8-GPU group shrinks model-state and activation memory together.</p>
+
+      <h2>TSP vs "TP + SP" — get this distinction first</h2>
+      <p>There are two ways to combine the two ideas, and they are <strong>not</strong> the same. This caused real confusion in the sessions, so we'll be explicit.</p>
+
+      <h3>TP + SP: a 2D grid of GPUs (two separate axes)</h3>
+      <p>Give yourself <code>T × Σ</code> GPUs arranged in a grid. One axis does tensor parallelism, the other does sequence parallelism. With <code>T=2, Σ=2</code> you need <strong>4 GPUs</strong>, and every (head-shard, token-shard) combination physically exists:</p>
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:80px 120px 120px;max-width:340px;margin:0 auto">
+          <div class="cell empty" style="border:none;background:none"></div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">head shard 0</div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">head shard 1</div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">seq shard 0</div>
+          <div class="cell r0">rank 0</div>
+          <div class="cell r1">rank 1</div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">seq shard 1</div>
+          <div class="cell r2">rank 2</div>
+          <div class="cell r3">rank 3</div>
+        </div>
+        <div class="cap">TP+SP, 4 GPUs. Every grid cell is filled. No forward-time weight movement is needed — each rank permanently holds its (head, token) combination.</div>
+      </div>
+
+      <h3>TSP: fold both onto one axis (the diagonal)</h3>
+      <p>TSP is more economical with GPUs: it puts <em>both</em> roles on the <em>same</em> set of GPUs. With <code>D=2</code> ranks, rank <code>i</code> owns sequence-shard <code>i</code> <em>and</em> head-shard <code>i</code> — the <strong>diagonal</strong> of that grid. The off-diagonal cells don't physically exist anywhere:</p>
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:80px 120px 120px;max-width:340px;margin:0 auto">
+          <div class="cell empty" style="border:none;background:none"></div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">head shard 0</div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">head shard 1</div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">seq shard 0</div>
+          <div class="cell r0">rank 0</div>
+          <div class="cell empty">missing</div>
+          <div class="cell" style="background:none;border:none;color:var(--text-dim)">seq shard 1</div>
+          <div class="cell empty">missing</div>
+          <div class="cell r1">rank 1</div>
+        </div>
+        <div class="cap">TSP, 2 GPUs. Only the diagonal exists. Rank 0 has (seq 0, head 0); rank 1 has (seq 1, head 1). The "missing" cells are why TSP needs a loop.</div>
+      </div>
+
+      <div class="callout key">
+        <span class="label">The defining problem of TSP</span>
+        <p>Rank 0 holds sequence-shard 0 but only head-shard 0's weights. To produce the <em>full</em> output for its tokens, rank 0 needs <em>every</em> head shard applied to its tokens — including head shards it doesn't own. So TSP <strong>loops over all weight (head) shards</strong>, circulating each shard to every rank in turn. That loop is the cost of folding two axes onto one set of GPUs.</p>
+      </div>
+
+      <h2>Algorithm 1: TSP attention, line by line</h2>
+      <p>This is the implementation target from the paper. <code>r</code> is the weight-owner index (which head shard we're currently processing); <code>p</code> is this rank's sequence-shard. We accumulate the output for our local tokens, <code>Y_p</code>, across all weight shards.</p>
+
+      <pre><code>Y_p = 0
+<span class="tok-key">for</span> r <span class="tok-key">in</span> 0..D-1:                          <span class="tok-com"># loop over every head/weight shard</span>
+    broadcast [Wq_r, Wk_r, Wv_r, Wo_r]      <span class="tok-com"># circulate shard r's weights to all ranks</span>
+    Q_rp = X_p @ Wq_r.T                      <span class="tok-com"># my tokens, shard r's query proj</span>
+    K_rp = X_p @ Wk_r.T
+    V_rp = X_p @ Wv_r.T
+    K_r, V_r = all_gather(K_rp, V_rp)        <span class="tok-com"># gather K/V over SEQUENCE ranks p</span>
+    A_rp = causal_attn(Q_rp, K_r, V_r)       <span class="tok-com"># my tokens attend to full sequence, shard r</span>
+    Y_p += A_rp @ Wo_r.T                      <span class="tok-com"># accumulate shard r's residual contribution</span></code></pre>
+
+      <p>Walk the shapes (with <code>D</code> ranks, this rank holds <code>S/D</code> tokens):</p>
+      <table>
+        <thead><tr><th>Tensor</th><th>Shape</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>X_p</code></td><td><span class="shape">[B, S/D, H]</span></td><td>my token chunk (sequence-sharded)</td></tr>
+          <tr><td><code>Wq_r, Wk_r, Wv_r</code></td><td><span class="shape">[H/D, H]</span></td><td>shard r's Q/K/V weights (one head group)</td></tr>
+          <tr><td><code>Wo_r</code></td><td><span class="shape">[H, H/D]</span></td><td>shard r's output projection</td></tr>
+          <tr><td><code>Q_rp, K_rp, V_rp</code></td><td><span class="shape">[B, S/D, H/D]</span></td><td>my tokens through shard r's projections</td></tr>
+          <tr><td><code>K_r, V_r</code> (after gather)</td><td><span class="shape">[B, S, H/D]</span></td><td>full sequence of K/V for shard r</td></tr>
+          <tr><td><code>A_rp</code></td><td><span class="shape">[B, S/D, H/D]</span></td><td>attention output, my tokens, shard r</td></tr>
+          <tr><td><code>Y_p</code> (accumulated)</td><td><span class="shape">[B, S/D, H]</span></td><td>final output for my tokens</td></tr>
+        </tbody>
+      </table>
+
+      <h2>The two "aha"s that took real correction</h2>
+
+      <h3>1. There is NO final all_reduce</h3>
+      <p>You might expect, like TP, an <code>all_reduce</code> at the end. There isn't one — and this was an explicit correction in the sessions. Why not? <strong>Each rank owns a different set of output tokens</strong> (it's sequence-sharded). So there's nothing to sum <em>across ranks</em>. The sum that <em>does</em> happen — summing over head shards — happens <strong>locally</strong>, as the <code>Y_p += …</code> accumulation inside the loop. Rank <code>p</code>'s loop walks every head shard and adds up their contributions to <em>its own</em> tokens. The cross-rank reduction TP needed is replaced by a local sum over loop iterations.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Two other corrections from the notes, so you don't repeat them</span>
+        <p>• <strong>Include <code>Wo</code> in the broadcast</strong> — it's easy to forget the output-projection shard and only circulate Q/K/V.<br>
+        • Use <code>causal_attn(Q, K, V)</code> — <em>not</em> <code>causal_attn(Q, K, K)</code>. A genuine typo-class bug: the value argument must be V, not K.<br>
+        • For a fixed weight shard <code>r</code>, the <code>all_gather</code> is over the <strong>sequence</strong> ranks <code>p</code> — you're rebuilding the full key/value sequence, just as in SP.</p>
+      </div>
+
+      <h3>2. Why the loop exists at all (the 2-GPU teaching version)</h3>
+      <p>On only 2 ranks, the loop is compensating for the missing off-diagonal grid cells. Rank 0 has (seq 0, head 0) and rank 1 has (seq 1, head 1); the pairs (seq 0, head 1) and (seq 1, head 0) exist nowhere. The loop broadcasts each head shard to every sequence shard so the missing combinations get computed on the fly. As the session put it: <em>"The loop is not accidental; it is compensating for the missing grid cells."</em></p>
+
+      <h2>Try it: the shape calculator</h2>
+      <p>Look at the TSP rows. <code>X_p</code> is <code>[B, S/D, H]</code> (activations shrank, like SP) <em>and</em> each weight shard is <code>[H/D, H]</code> (weights shrank, like TP). That simultaneous reduction on one set of GPUs is the entire promise of TSP.</p>
+
+      <div class="calc">
+        <div class="inputs">
+          <div><label>B (batch)</label><input id="c-B" type="number" value="1" min="1"></div>
+          <div><label>S (seq len)</label><input id="c-S" type="number" value="8192" min="1"></div>
+          <div><label>H (hidden)</label><input id="c-H" type="number" value="4096" min="1"></div>
+          <div><label>num_heads</label><input id="c-heads" type="number" value="32" min="1"></div>
+          <div><label>D (GPUs)</label><input id="c-D" type="number" value="8" min="1"></div>
+        </div>
+        <div class="err"></div>
+        <div class="out"></div>
+      </div>
+
+      <h2>TSP for the MLP</h2>
+      <p>Same spirit: weight shards <strong>rotate</strong> across ranks while each rank accumulates the output for its <em>local tokens</em>. Because the MLP is token-independent there's no K/V gather, but there's still the weight movement — each rank needs every weight shard applied to its tokens, so the shards circulate and outputs accumulate locally.</p>
+
+      <h2>The honest caveat the report makes</h2>
+      <div class="callout warn">
+        <span class="label">This teaching implementation is deliberately slow</span>
+        <p>Broadcasting weight shards <em>during every forward pass</em> is expensive, and the loop means each rank touches every head shard (so it isn't getting TP's compute savings — only the memory savings). The report is upfront: real implementations would keep shards resident, overlap the weight movement with compute, and use ring-attention instead of full K/V gather. The version in the repo prioritizes <em>correctness and clarity</em> so you can see the algorithm. Module 8 quantifies exactly what that costs.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>With D=2, why does rank 0 need a loop at all — doesn't it have everything for its own tokens?</summary>
+        <div class="answer">
+          <p>No. Rank 0 has its tokens (seq shard 0) but only head shard 0's <em>weights</em>. The full output for its tokens needs <em>all</em> head shards applied to them, including head shard 1, which lives on rank 1. The loop circulates each head shard to rank 0 (and every rank) so the missing (seq 0, head 1) combination gets computed. On the diagonal-only layout, the off-diagonal cells must be reconstructed by moving weights.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>TP attention ends with all_reduce. Why does TSP attention NOT, even though it also sums over head shards?</summary>
+        <div class="answer">
+          <p>In TP the sum over head shards is spread <em>across ranks</em> (each rank holds different heads of the same tokens), so it needs a cross-rank all_reduce. In TSP each rank already iterates over <em>every</em> head shard itself, inside its loop, and accumulates into <code>Y_p</code> locally. The head-shard sum is a local <code>+=</code>, not a collective. And because each rank owns disjoint output tokens (sequence-sharded), there's nothing to reduce across ranks at all.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>What's the difference between "TSP" and "TP+SP", in one line each?</summary>
+        <div class="answer">
+          <p><strong>TP+SP:</strong> a 2D grid of <code>T×Σ</code> GPUs; every (head, token) combination physically exists; no forward-time weight movement. <strong>TSP:</strong> both roles folded onto the <em>same</em> <code>D</code> GPUs (the diagonal); off-diagonal combinations are reconstructed by circulating weight shards in a loop during the forward pass. TSP uses fewer GPUs for the same two reductions but pays in weight traffic.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

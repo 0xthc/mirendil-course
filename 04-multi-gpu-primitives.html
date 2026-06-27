@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · Multi-GPU primitives</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 04</div>
+      <h1>Multi-GPU primitives</h1>
+      <p class="lede">As a full-stack engineer, this module is the one that'll feel most like home: it's distributed-systems programming. A handful of processes, each owning one GPU, coordinating through a small set of collective operations.</p>
+
+      <h2>The mental model: one process per GPU</h2>
+      <p>You do <strong>not</strong> write one program that drives 8 GPUs. You write <strong>one program that runs 8 times</strong> — once per GPU — and the copies talk to each other. This is the Single-Program-Multiple-Data (SPMD) model. If you've written code with MPI, or even just thought about how 8 identical web server replicas coordinate through a shared channel, you already have the right instinct.</p>
+
+      <pre><code><span class="tok-com"># You launch it like this — torchrun spawns 8 copies of the script:</span>
+torchrun --standalone --nproc_per_node=8 tensor_parallelism.py</code></pre>
+
+      <p>Each copy is a <strong>rank</strong>. Three environment variables tell a copy who it is:</p>
+      <table>
+        <thead><tr><th>Variable</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>RANK</code></td><td>This process's global ID, <code>0 … world_size-1</code>. Rank 0 is conventionally the "leader".</td></tr>
+          <tr><td><code>LOCAL_RANK</code></td><td>Which GPU on <em>this physical machine</em> this process should use. On a single 8-GPU box, <code>LOCAL_RANK == RANK</code>.</td></tr>
+          <tr><td><code>WORLD_SIZE</code></td><td>Total number of processes (= total GPUs). Here, 8. This is the <code>D</code> from module 1.</td></tr>
+        </tbody>
+      </table>
+
+      <p>Here's the real setup code from the repo. Read it as "figure out who I am, bind myself to my GPU, and join the group":</p>
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">setup_distributed</span>():
+    dist.init_process_group(backend=<span class="tok-str">"nccl"</span>)   <span class="tok-com"># join the group; NCCL = NVIDIA's GPU comms library</span>
+
+    rank = dist.get_rank()                  <span class="tok-com"># who am I globally?</span>
+    world_size = dist.get_world_size()      <span class="tok-com"># how many of us are there?</span>
+    LOCAL_RANK = int(os.environ[<span class="tok-str">"LOCAL_RANK"</span>])
+
+    torch.cuda.set_device(LOCAL_RANK)       <span class="tok-com"># claim my GPU</span>
+    device = torch.device(<span class="tok-str">"cuda"</span>, LOCAL_RANK)
+    <span class="tok-key">return</span> rank, world_size, LOCAL_RANK, device</code></pre>
+
+      <div class="callout key">
+        <span class="label">NCCL</span>
+        <p><code>backend="nccl"</code> selects NVIDIA's Collective Communications Library — the thing that actually moves tensors GPU-to-GPU over fast links (NVLink). You never call NCCL directly; you call the <code>dist.*</code> collectives below and NCCL does the wire-level work. (On CPU-only test runs the repo uses the <code>gloo</code> backend instead.)</p>
+      </div>
+
+      <h2>The three collectives — your entire toolbox</h2>
+      <p>Astonishingly, the whole course is built from just three communication operations. A <strong>collective</strong> is an operation that <em>every rank calls together</em>. Each one answers a different question: "how do I share data across ranks?"</p>
+
+      <h3>broadcast — one-to-all</h3>
+      <p>One rank has a tensor; everyone else gets an identical copy.</p>
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
+          <div class="cell r0">rank0<br>[ABCD]</div>
+          <div class="cell empty">rank1<br>[ ? ]</div>
+          <div class="cell empty">rank2<br>[ ? ]</div>
+          <div class="cell empty">rank3<br>[ ? ]</div>
+        </div>
+        <div style="text-align:center;color:var(--accent);margin:8px 0;font-size:20px">↓ broadcast(src=0) ↓</div>
+        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
+          <div class="cell r0">rank0<br>[ABCD]</div>
+          <div class="cell r0">rank1<br>[ABCD]</div>
+          <div class="cell r0">rank2<br>[ABCD]</div>
+          <div class="cell r0">rank3<br>[ABCD]</div>
+        </div>
+        <div class="cap">Used at setup to give every GPU the same starting weights, and in TSP to circulate weight shards during the forward pass.</div>
+      </div>
+      <pre><code>dist.broadcast(tensor, src=0)   <span class="tok-com"># rank 0 fills tensor; all others receive into it</span></code></pre>
+      <p>Subtle but important: <strong>every</strong> rank must call <code>broadcast</code>. The source rank supplies the data; the others pass an empty buffer of the right shape to receive into. If even one rank skips the call, the whole group deadlocks (more on that below).</p>
+
+      <h3>all_reduce — combine-and-share</h3>
+      <p>Every rank has a tensor of the <em>same shape but different values</em>. <code>all_reduce</code> combines them element-wise (usually by summing) and gives <em>everyone</em> the combined result.</p>
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
+          <div class="cell r0">rank0<br>[1,0,0]</div>
+          <div class="cell r1">rank1<br>[0,2,0]</div>
+          <div class="cell r2">rank2<br>[0,0,3]</div>
+          <div class="cell r3">rank3<br>[1,1,1]</div>
+        </div>
+        <div style="text-align:center;color:var(--accent);margin:8px 0;font-size:20px">↓ all_reduce(SUM) ↓</div>
+        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
+          <div class="cell r0">rank0<br>[2,3,4]</div>
+          <div class="cell r0">rank1<br>[2,3,4]</div>
+          <div class="cell r0">rank2<br>[2,3,4]</div>
+          <div class="cell r0">rank3<br>[2,3,4]</div>
+        </div>
+        <div class="cap">Each rank computed a <em>partial</em> result; summing the partials gives the true full result. This is exactly the TP attention output step.</div>
+      </div>
+      <pre><code>dist.all_reduce(tensor, op=dist.ReduceOp.SUM)   <span class="tok-com"># in-place: tensor becomes the sum across ranks</span></code></pre>
+      <p>Use this when each rank has computed <strong>part of a sum</strong> and the true answer is the total. The shapes match; you're adding numbers in corresponding positions.</p>
+
+      <h3>all_gather — collect-the-pieces</h3>
+      <p>Every rank has a <em>different chunk</em> of some larger tensor. <code>all_gather</code> concatenates all the chunks and gives everyone the full assembled tensor.</p>
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
+          <div class="cell r0">rank0<br>[A]</div>
+          <div class="cell r1">rank1<br>[B]</div>
+          <div class="cell r2">rank2<br>[C]</div>
+          <div class="cell r3">rank3<br>[D]</div>
+        </div>
+        <div style="text-align:center;color:var(--accent);margin:8px 0;font-size:20px">↓ all_gather ↓</div>
+        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
+          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank0<br>[ABCD]</div>
+          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank1<br>[ABCD]</div>
+          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank2<br>[ABCD]</div>
+          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank3<br>[ABCD]</div>
+        </div>
+        <div class="cap">Pieces are <em>concatenated</em>, not summed. This is exactly how SP reassembles the full K/V sequence from per-GPU token chunks.</div>
+      </div>
+      <pre><code>gathered = [torch.empty_like(chunk) <span class="tok-key">for</span> _ <span class="tok-key">in</span> range(world_size)]
+dist.all_gather(gathered, chunk)        <span class="tok-com"># gathered[i] = the chunk that rank i contributed</span>
+full = torch.cat(gathered, dim=...)     <span class="tok-com"># then concatenate along the right axis</span></code></pre>
+
+      <div class="callout key">
+        <span class="label">The distinction that matters most</span>
+        <p><strong><code>all_reduce</code> sums overlapping values; <code>all_gather</code> concatenates distinct pieces.</strong> Choosing wrong is the classic bug. If each rank computed a partial sum of the same thing → <code>all_reduce</code>. If each rank holds a different slice that needs to sit side by side → <code>all_gather</code>. TP's output uses <code>all_reduce</code>; SP's K/V uses <code>all_gather</code>. Keep that pair in mind.</p>
+      </div>
+
+      <h2>The deadlock rule (the one bug you'll actually hit)</h2>
+      <p>Collectives are <strong>synchronization points</strong>. Every rank must call <em>the same collectives, in the same order</em>. If rank 0 calls <code>all_gather</code> while rank 1 calls <code>all_reduce</code> — or rank 1 skips a call inside an <code>if</code> branch — the group <strong>hangs forever</strong>, silently. There's no crash, just a stuck program.</p>
+      <div class="callout gotcha">
+        <span class="label">This actually happened in the sessions</span>
+        <p>The original SP implementation "was hanging." The cause was exactly this class of bug — a collective-call mismatch across ranks. The fix is discipline: issue collectives unconditionally and identically on every rank. Later, in TSP, you'll see a loop <code>for r in range(world_size)</code> that broadcasts weights each iteration — and the explicit constraint that <em>all ranks must run that loop the same number of times in the same order</em>, or it deadlocks.</p>
+      </div>
+
+      <h2>Why broadcast weights at setup?</h2>
+      <p>A pattern you'll see everywhere: rank 0 creates the full random weights and input, then <code>broadcast</code>s them so every rank starts <em>identical</em>. Then each rank slices out its own shard locally. Why not just let each rank generate its own shard with the same random seed?</p>
+      <div class="quiz" style="margin-top:8px"><details><summary>The answer (a real question from the sessions)</summary><div class="answer">
+        <p>If every rank used the same seed, every rank would generate the <em>same</em> shard — defeating the point of sharding (you'd have 8 copies of slice 0 and no copies of the others). And if they used <em>different</em> seeds, the shards wouldn't fit together into one coherent weight matrix, so you couldn't validate against a single-GPU reference. The clean teaching approach: one rank makes the whole true weight, broadcasts it, and each rank deterministically slices out a <em>different</em> piece. (In real production you'd load only your shard from disk and skip the broadcast — that's listed as future work in the report.)</p>
+      </div></details></div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Each of 4 GPUs computed a [B,S,H] tensor that represents one-quarter of a sum. You want the full result on every GPU. Which collective?</summary>
+        <div class="answer">
+          <p><strong>all_reduce(SUM)</strong>. The four tensors have the same shape and represent partial sums of the same quantity; summing them element-wise gives the true total, and all_reduce leaves that total on every rank.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Each of 4 GPUs holds the keys for a different 2K-token chunk of an 8K sequence. You want the full 8K keys on every GPU. Which collective?</summary>
+        <div class="answer">
+          <p><strong>all_gather</strong>. The chunks are distinct slices that must sit side by side to reconstruct the 8K sequence — concatenation, not summation. (Then a <code>torch.cat</code>, or better, gather straight into a preallocated buffer — an optimization the repo actually made.)</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Your 8-rank program runs fine on 7 ranks but rank 3 took an early <code>return</code> inside an <code>if</code>. What happens, and why is it hard to debug?</summary>
+        <div class="answer">
+          <p>The program <strong>hangs forever</strong>. The other 7 ranks reach a collective and wait for rank 3 to join it, but rank 3 already left. No exception is raised — it just deadlocks silently. That's why the rule is "every rank issues every collective, identically, in the same order," and why conditional logic around collectives is dangerous.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · Tensor parallelism (TP)</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 05</div>
+      <h1>Tensor parallelism (TP)</h1>
+      <p class="lede">The first real strategy. Split the weights across GPUs so no GPU holds a full weight matrix. The whole sequence stays replicated everywhere. We shard attention by <em>heads</em>.</p>
+
+      <h2>The core idea: heads are already independent</h2>
+      <p>Recall from module 3 that attention runs <code>num_heads</code> heads in parallel — each head does its own little attention in its own <code>head_dim</code>-wide lane, and the results are concatenated at the end. The heads <strong>never talk to each other</strong> inside attention. That independence is a gift: we can just give different heads to different GPUs.</p>
+      <p>With 8 GPUs and 32 heads, each GPU owns <code>32 / 8 = 4</code> heads. GPU 0 computes heads 0–3, GPU 1 computes heads 4–7, and so on. Each GPU does <code>1/8</code> of the attention work and stores <code>1/8</code> of the Q/K/V weights.</p>
+
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:repeat(4,1fr);max-width:560px;margin:0 auto">
+          <div class="cell r0">GPU0<br>heads 0–3</div>
+          <div class="cell r1">GPU1<br>heads 4–7</div>
+          <div class="cell r2">GPU2<br>heads 8–11</div>
+          <div class="cell r3">GPU3<br>heads 12–15</div>
+        </div>
+        <div class="cap">Head sharding (showing 4 of 8 GPUs). The input X is fully replicated on every GPU; only the heads — and the weights that produce them — are divided.</div>
+      </div>
+
+      <h2>Column-parallel vs row-parallel: the only hard part</h2>
+      <p>Here's the question that generated the most back-and-forth in the original sessions: <em>Q/K/V and the output projection W_o are all square <code>[H, H]</code> matrices — why can't I shard them the same way?</em> The answer is that they sit on <strong>opposite sides</strong> of the attention operation, so they must be sliced along <strong>different axes</strong>.</p>
+
+      <p>Reason from input/output axes (not from the visual "rows look like columns" trap). Remember <code>F.linear(X, W)</code> computes <code>X @ W.T</code> with <code>W</code> stored as <span class="shape">[out_features, in_features]</span>.</p>
+
+      <h3>Column-parallel — split the OUTPUT features (used for Q, K, V)</h3>
+      <p>The Q/K/V projections come <em>before</em> attention. Their job is to produce the per-head Q/K/V. Since GPU 0 only needs the Q/K/V for <em>its</em> heads, it only needs the slice of <code>W_q</code> that produces those output features. We split the output dimension:</p>
+      <pre><code>W_q is [H, H] = [out, in].  Slice the OUT (head) dimension:
+   W_q_p on rank p = W_q[p*chunk : (p+1)*chunk, :]   <span class="tok-com"># shape [H/D, H]</span>
+   X @ W_q_p.T  ->  [B, S, H/D]    <span class="tok-com"># only this rank's heads</span></code></pre>
+      <p>"Column-parallel" because, in the math convention where you'd write <code>X·W</code>, you're splitting <code>W</code>'s output <em>columns</em>. Each rank produces a <em>different, complete</em> slice of the output — no summing needed yet. Input <code>X</code> is replicated, so every rank can compute its slice independently.</p>
+
+      <h3>Row-parallel — split the INPUT features (used for W_o)</h3>
+      <p>The output projection <code>W_o</code> comes <em>after</em> attention. Its input is the concatenated head outputs. But GPU 0 only <em>has</em> its own heads' outputs — a partial input. So GPU 0 takes the slice of <code>W_o</code> that consumes <em>those</em> input features. We split the input dimension:</p>
+      <pre><code>W_o is [H, H] = [out, in].  Slice the IN (head) dimension:
+   W_o_p on rank p = W_o[:, p*chunk : (p+1)*chunk]   <span class="tok-com"># shape [H, H/D]</span>
+   attn_p @ W_o_p.T  ->  [B, S, H]   <span class="tok-com"># a PARTIAL full-width output</span></code></pre>
+      <p>Now each rank produces a <span class="shape">[B, S, H]</span> tensor that is the <em>partial</em> contribution of its heads to the final answer. The true output is the <strong>sum</strong> of all ranks' partials. That's the <code>all_reduce</code>.</p>
+
+      <div class="callout key">
+        <span class="label">The pattern that recurs forever</span>
+        <p><strong>Column-parallel (split output) → no communication, each rank holds a distinct slice. Row-parallel (split input) → produces partial sums → needs an <code>all_reduce</code> to combine.</strong> Attention is column-parallel Q/K/V followed by row-parallel W_o. The all_reduce at the end is the price of having split W_o by input.</p>
+      </div>
+
+      <h2>The insight everyone trips on: head-space vs residual-space</h2>
+      <p>This was singled out in the teaching notes as "the user's main gap," so it's worth slowing down. Before <code>W_o</code>, the attention output is in <strong>head space</strong> — it's per-head features, <em>not</em> yet a meaningful update to the token's residual vector. <code>W_o</code> is the thing that <em>translates</em> head-space features into residual-space updates. So when you shard heads, you're sharding head-space; each rank's head-space slice produces a partial residual-space vector, and those partials sum.</p>
+      <p>Concretely, view it as a block sum. With 4 heads, write the attention output as four side-by-side blocks and <code>W_o</code> as four stacked blocks:</p>
+      <pre><code>attn = [A0 | A1 | A2 | A3]      each Ai: [B, S, head_dim]
+W_o  = [W0 ; W1 ; W2 ; W3]      each Wi: [head_dim, H]
+
+attn @ W_o = A0@W0 + A1@W1 + A2@W2 + A3@W3      <span class="tok-com"># a SUM of per-head terms!</span></code></pre>
+      <p>Each term <code>Ai @ Wi</code> is a full <span class="shape">[B, S, H]</span> residual update from one head. The output projection is <em>secretly a sum over heads</em>. So if rank 0 owns heads 0–1 it computes <code>A0@W0 + A1@W1</code>, rank 1 owns heads 2–3 and computes <code>A2@W2 + A3@W3</code>, and <code>all_reduce</code> adds the two partials. The math of TP <em>is</em> just rearranging this sum across GPUs.</p>
+
+      <h2>The whole thing in code</h2>
+      <p>Here's <code>tp_attn</code> from <code>tensor_parallelism.py</code>. Every line should now read as obvious:</p>
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">tp_attn</span>(X, W_q_p, W_k_p, W_v_p, W_o_p, p_heads):
+    B, S, H = X.shape           <span class="tok-com"># X is REPLICATED: full [B, S, H] on every rank</span>
+
+    <span class="tok-com"># column-parallel Q/K/V: each produces only this rank's heads</span>
+    q = project_to_heads(F.linear(X, W_q_p), p_heads, head_dim)   <span class="tok-com"># [B, p_heads, S, head_dim]</span>
+    k = project_to_heads(F.linear(X, W_k_p), p_heads, head_dim)
+    v = project_to_heads(F.linear(X, W_v_p), p_heads, head_dim)
+
+    attn_p = F.scaled_dot_product_attention(q, k, v, is_causal=<span class="tok-key">True</span>)
+    attn_p = attn_p.transpose(1, 2).contiguous().view(B, S, p_hidden)
+
+    out = F.linear(attn_p, W_o_p)        <span class="tok-com"># row-parallel: PARTIAL [B, S, H]</span>
+    dist.all_reduce(out, op=dist.ReduceOp.SUM)   <span class="tok-com"># sum partials -> true output</span>
+    <span class="tok-key">return</span> out</code></pre>
+
+      <h2>TP for the MLP (same pattern, even simpler)</h2>
+      <p>The MLP is <code>W_in</code> (expand <code>H→I</code>) then <code>W_out</code> (contract <code>I→H</code>). Same recipe: <strong>column-parallel the first matrix</strong> (split the intermediate dimension <code>I</code> — each rank computes a slice of the expanded hidden), <strong>row-parallel the second</strong> (each rank consumes its slice of <code>I</code> and produces a partial output), then <code>all_reduce</code>. Expand-then-contract maps perfectly onto column-then-row.</p>
+
+      <h2>Try it: the shape calculator</h2>
+      <p>Play with the numbers. Notice for TP that <strong>X stays <code>[B, S, H]</code> on every rank</strong> (activations are <em>not</em> reduced — that's TP's whole limitation), while the weights and the per-head tensors shrink by <code>D</code>.</p>
+
+      <div class="calc">
+        <div class="inputs">
+          <div><label>B (batch)</label><input id="c-B" type="number" value="1" min="1"></div>
+          <div><label>S (seq len)</label><input id="c-S" type="number" value="8192" min="1"></div>
+          <div><label>H (hidden)</label><input id="c-H" type="number" value="4096" min="1"></div>
+          <div><label>num_heads</label><input id="c-heads" type="number" value="32" min="1"></div>
+          <div><label>D (GPUs)</label><input id="c-D" type="number" value="8" min="1"></div>
+        </div>
+        <div class="err"></div>
+        <div class="out"></div>
+      </div>
+
+      <div class="callout warn">
+        <span class="label">What TP did and didn't buy you</span>
+        <p>Look at the TP rows in the calculator. The weights and per-head Q/K/V shrank by <code>D</code> — model-state memory win. But the replicated <code>X</code> and the full-sequence attention are unchanged — <strong>zero activation-memory win</strong>. That gap is precisely what sequence parallelism (next module) exists to close.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Q/K/V and W_o are all [H, H]. Why can't you reuse the same sharding function for both?</summary>
+        <div class="answer">
+          <p>Because the slice <em>axis</em> differs. Q/K/V are column-parallel (split the output/head dimension — the rows of the stored <code>[out, in]</code> weight), since their input X is replicated and each rank should produce a distinct slice of output. W_o is row-parallel (split the input dimension — the columns of the stored weight), since its input is already a per-head partial and each rank should consume only its heads. Same shape, opposite axis — so you need two different slicing helpers (<code>shard_col_parallel</code> vs <code>shard_row_parallel</code> in the code).</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why does TP attention end with all_reduce rather than all_gather?</summary>
+        <div class="answer">
+          <p>Because the row-parallel W_o makes each rank produce a <em>partial sum</em> of the same full-width <code>[B,S,H]</code> output — the per-head contributions that must be <strong>added</strong>. all_gather would concatenate distinct pieces, which is wrong here: the pieces overlap and represent the same positions. You want all_reduce(SUM).</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>You scale to S = 64K with TP on 8 GPUs and still run out of memory. Did TP fail? What's the fix?</summary>
+        <div class="answer">
+          <p>TP didn't fail at its job — it shrank the weights — but it never touches activation memory, and at 64K tokens the activations (full sequence replicated on every GPU) are what's blowing up. The fix is to also shard the <em>sequence</em>: that's Sequence Parallelism (module 6), and ultimately TSP (module 7), which shrinks both at once.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

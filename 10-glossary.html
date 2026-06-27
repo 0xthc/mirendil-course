@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10 · Glossary & cheat sheet</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 10</div>
+      <h1>Glossary &amp; cheat sheet</h1>
+      <p class="lede">Keep this page open while you read the actual repo code. Everything in one place.</p>
+
+      <h2>Symbols</h2>
+      <table>
+        <thead><tr><th>Symbol</th><th>Meaning</th></tr></thead>
+        <tbody>
+          <tr><td><code>B</code></td><td>batch size — number of sequences at once</td></tr>
+          <tr><td><code>S</code></td><td>sequence length — tokens per sequence (also <code>Sloc = S/D</code> = local shard)</td></tr>
+          <tr><td><code>H</code> / <code>h</code></td><td>hidden size — width of each token vector (residual/embedding dim)</td></tr>
+          <tr><td><code>num_heads</code></td><td>number of attention heads</td></tr>
+          <tr><td><code>head_dim</code></td><td>width per head = <code>H / num_heads</code> (sometimes written <code>D</code> in attention context)</td></tr>
+          <tr><td><code>D</code></td><td>parallel degree = number of GPUs/ranks (= WORLD_SIZE). <em>In TSP context, not head_dim.</em></td></tr>
+          <tr><td><code>p</code></td><td>current sequence-shard rank (which token chunk this GPU owns)</td></tr>
+          <tr><td><code>r</code></td><td>weight-owner index (which head/weight shard is being processed in the TSP loop)</td></tr>
+          <tr><td><code>T, Σ</code></td><td>in TP+SP: tensor-parallel degree and sequence-parallel degree, with <code>T·Σ = D</code></td></tr>
+          <tr><td><code>I</code></td><td>MLP intermediate size (the expanded width, typically <code>4·H</code>)</td></tr>
+        </tbody>
+      </table>
+
+      <h2>The three collectives</h2>
+      <table>
+        <thead><tr><th>Op</th><th>Does</th><th>Used for</th></tr></thead>
+        <tbody>
+          <tr><td><code>broadcast</code></td><td>one rank → identical copy on all</td><td>setup (share weights); TSP weight-shard circulation</td></tr>
+          <tr><td><code>all_reduce</code></td><td>sum same-shaped tensors → result on all</td><td>TP output (combine row-parallel partials)</td></tr>
+          <tr><td><code>all_gather</code></td><td>concatenate distinct chunks → full on all</td><td>SP & TSP K/V gather (rebuild full sequence)</td></tr>
+        </tbody>
+      </table>
+      <div class="callout key"><span class="label">The rule</span><p><strong>all_reduce sums overlapping values; all_gather concatenates distinct pieces.</strong> Every rank must call every collective in the same order or the group deadlocks.</p></div>
+
+      <h2>Weight sharding</h2>
+      <table>
+        <thead><tr><th>Type</th><th>Splits</th><th>Result</th><th>Needs combine?</th><th>Where</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Column-parallel</strong></td><td>output features (rows of stored <code>[out,in]</code> weight)</td><td>each rank: a distinct output slice</td><td>No</td><td>Q/K/V; MLP W_in</td></tr>
+          <tr><td><strong>Row-parallel</strong></td><td>input features (columns of stored weight)</td><td>each rank: a partial full-width output</td><td>Yes → <code>all_reduce</code></td><td>W_o; MLP W_out</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Strategy comparison (the master table)</h2>
+      <table>
+        <thead><tr><th></th><th>TP</th><th>SP</th><th>TSP</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Splits</strong></td><td>weights (by head)</td><td>tokens</td><td>both, folded on one axis</td></tr>
+          <tr><td><strong>X is</strong></td><td>replicated <code>[B,S,H]</code></td><td>seq-sharded <code>[B,S/D,H]</code></td><td>seq-sharded <code>[B,S/D,H]</code></td></tr>
+          <tr><td><strong>Weights are</strong></td><td>sharded</td><td>replicated</td><td>sharded</td></tr>
+          <tr><td><strong>Model mem</strong></td><td>1/D ✅</td><td>1 ❌</td><td>≈1/D ✅</td></tr>
+          <tr><td><strong>Activation mem</strong></td><td>1 ❌</td><td>1/D ✅</td><td>≈1/D ✅</td></tr>
+          <tr><td><strong>Attn comms</strong></td><td>all_reduce (end)</td><td>all_gather K/V (mid)</td><td>broadcast W + all_gather K/V (loop)</td></tr>
+          <tr><td><strong>Speed (test)</strong></td><td>fastest</td><td>slow</td><td>slowest (un-overlapped)</td></tr>
+          <tr><td><strong>Peak mem (test)</strong></td><td>middle</td><td>highest</td><td>lowest ✅</td></tr>
+        </tbody>
+      </table>
+
+      <h2>TSP attention algorithm (memorize this)</h2>
+      <pre><code>Y_p = 0
+<span class="tok-key">for</span> r <span class="tok-key">in</span> 0..D-1:
+    broadcast [Wq_r, Wk_r, Wv_r, Wo_r]   <span class="tok-com"># don't forget Wo!</span>
+    Q_rp = X_p @ Wq_r.T
+    K_rp = X_p @ Wk_r.T
+    V_rp = X_p @ Wv_r.T
+    K_r, V_r = all_gather(K_rp, V_rp)     <span class="tok-com"># over sequence ranks p</span>
+    A_rp = causal_attn(Q_rp, K_r, V_r)    <span class="tok-com"># V, not K!</span>
+    Y_p += A_rp @ Wo_r.T                   <span class="tok-com"># local sum over r; NO all_reduce</span></code></pre>
+
+      <h2>The repo files</h2>
+      <table>
+        <thead><tr><th>File</th><th>What's in it</th></tr></thead>
+        <tbody>
+          <tr><td><code>tensor_parallelism.py</code></td><td>TP attention + MLP, sharding helpers, single-GPU reference <code>attn</code>/<code>mlp</code></td></tr>
+          <tr><td><code>sequence_parallelism.py</code></td><td>SP attention + MLP, the <code>all_gather_seq</code> K/V helper</td></tr>
+          <tr><td><code>ts_parallelism.py</code></td><td>TSP attention + MLP (the loop over weight shards)</td></tr>
+          <tr><td><code>profiler_utils.py</code></td><td><code>profile_rank_region</code> — per-rank memory + latency capture</td></tr>
+          <tr><td><code>iterate.py</code></td><td>Modal launcher: provisions 8×H100, runs torchrun, mounts the trace volume</td></tr>
+          <tr><td><code>report.md</code></td><td>the write-up: setup, results tables, limitations, future work</td></tr>
+          <tr><td><code>mirendil-test.md</code> / <code>attention-parallelism.md</code></td><td>the original learning-session transcripts this course is distilled from</td></tr>
+        </tbody>
+      </table>
+
+      <h2>Suggested reading order in the repo</h2>
+      <ol>
+        <li>Read the single-GPU <code>attn</code> and <code>mlp</code> at the top of <code>tensor_parallelism.py</code> — your reference point.</li>
+        <li>Read <code>tp_attn</code> / <code>tp_mlp</code> + the sharding helpers (module 5 concepts).</li>
+        <li>Read <code>sp_attn</code> and <code>all_gather_seq</code> (module 6).</li>
+        <li>Read <code>ts_parallelism.py</code> — the loop (module 7).</li>
+        <li>Skim <code>profiler_utils.py</code> and <code>iterate.py</code> (module 9).</li>
+        <li>Read <code>report.md</code> with module 8 next to it.</li>
+      </ol>
+
+      <div class="callout analogy">
+        <span class="label">You're done</span>
+        <p>You now have the full conceptual map of the mirendil test: why parallelism, how attention flows, the three collectives, TP/SP/TSP, the tradeoffs, and how it's measured. The code will read like prose. Go open <code>tensor_parallelism.py</code>.</p>
+      </div>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

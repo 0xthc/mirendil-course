@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>09 · Profiling & validation</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 09</div>
+      <h1>Profiling &amp; validation</h1>
+      <p class="lede">A parallel implementation is worthless if it's either wrong or unmeasured. This module covers the two things the test does around the algorithms: prove correctness, and measure cost.</p>
+
+      <h2>Part 1 — Proving correctness with a reference oracle</h2>
+      <p>How do you know your 8-GPU attention computes the same thing as plain attention? You compare against a <strong>single-GPU reference</strong> — an "oracle" you trust because it's simple. This is the same instinct as testing an optimized function against a naive one.</p>
+      <p>The recipe (from <code>report.md</code> and the runners):</p>
+      <ol>
+        <li>On rank 0, build the full weights and input, and compute the plain single-device output: <code>expected = attn(X, W_q, W_k, W_v, W_o)</code>.</li>
+        <li><code>broadcast</code> those same weights/input to all ranks, so everyone starts identical.</li>
+        <li>Run the parallel implementation to get <code>out</code>.</li>
+        <li>Assert <code>out</code> matches the corresponding slice of <code>expected</code>, within a tolerance.</li>
+        <li>Optionally <code>all_gather</code> every rank's output and check the reassembled full tensor equals the full reference.</li>
+      </ol>
+
+      <pre><code>expected = attn(X, W_q, W_k, W_v, W_o, num_heads)   <span class="tok-com"># trusted single-GPU answer</span>
+out = tp_attn(X, W_q_p, W_k_p, W_v_p, W_o_p, p_heads)
+torch.testing.assert_close(out, expected, rtol=<span class="tok-num">1e-5</span>, atol=<span class="tok-num">1e-5</span>)</code></pre>
+
+      <div class="callout key">
+        <span class="label">Why a tolerance, not exact equality?</span>
+        <p>Floating-point addition isn't associative — summing numbers in a different order gives slightly different results. The parallel version sums partials in a different order than the reference, so outputs differ in the last few bits. <code>atol/rtol = 1e-5</code> says "equal up to expected floating-point noise." Demanding exact equality would fail on correct code.</p>
+      </div>
+
+      <p>Two refinements the sessions arrived at, worth absorbing:</p>
+      <ul>
+        <li><strong>Validation is expensive and distorts profiling.</strong> Computing the full dense reference on every rank costs more than the implementation itself. So the mature workflow is: <em>validate on small shapes, then profile big shapes separately</em> with validation turned off. The repo went back and forth adding/removing these checks for exactly this reason.</li>
+        <li><strong>Warm up before timing.</strong> The first run includes one-time CUDA setup. The runners do an untimed warmup call, then <code>torch.cuda.synchronize()</code>, then profile a second call.</li>
+      </ul>
+
+      <h2>Part 2 — Measuring memory and latency</h2>
+      <p>Two numbers matter for this kind of work:</p>
+      <ul>
+        <li><strong>Peak memory per GPU</strong> — the high-water mark of allocated memory. This is what decides whether the model <em>fits</em>. <code>torch.cuda.max_memory_allocated()</code> reports it.</li>
+        <li><strong>Latency</strong> — wall-clock time for the region of interest. In a distributed run, the number that matters is the <strong>slowest rank</strong> (everyone waits for it), reported as <code>max_rank_elapsed_ms</code>. Mean-rank time is also tracked, to reveal imbalance.</li>
+      </ul>
+
+      <p>The repo wraps each attention call in a profiler context (<code>profile_rank_region</code> in <code>profiler_utils.py</code>) that does, per rank:</p>
+      <pre><code>dist.barrier()                          <span class="tok-com"># line up all ranks</span>
+torch.cuda.reset_peak_memory_stats()    <span class="tok-com"># zero the high-water mark</span>
+<span class="tok-key">with</span> torch.profiler.profile(
+        activities=[CPU, CUDA],
+        profile_memory=<span class="tok-key">True</span>,
+        record_shapes=<span class="tok-key">True</span>) <span class="tok-key">as</span> prof:
+    ... run the attention ...
+torch.cuda.max_memory_allocated()       <span class="tok-com"># peak this rank hit</span>
+prof.export_chrome_trace(...)           <span class="tok-com"># per-rank trace file you can open in a viewer</span></code></pre>
+
+      <div class="callout warn">
+        <span class="label">Per-rank, not global</span>
+        <p>Each rank writes its <em>own</em> trace file (e.g. <code>tp_attention_rank_3_trace.json</code>). There's no single global profiler — you collect 8 files and look at the worst one. The repo even stores them in a shared Modal Volume so all ranks' traces land in one place after the run.</p>
+      </div>
+
+      <h2>Where it runs: Modal + torchrun</h2>
+      <p>You don't own 8 H100s, so the test rents them on-demand via <strong>Modal</strong> (a serverless GPU platform). The chain, from <code>iterate.py</code>:</p>
+      <ol>
+        <li>Modal provisions a container with <code>h100:8</code> — eight H100 GPUs.</li>
+        <li>Inside, it runs <code>torchrun --nproc_per_node=8 tensor_parallelism.py</code> — spawning the 8 ranks from module 4.</li>
+        <li>Each rank binds to its <code>LOCAL_RANK</code> GPU, runs, and writes its trace to a mounted Volume.</li>
+        <li>A guard checks <code>world_size == EXPECTED_WORLD_SIZE</code> so a misconfigured launch fails loudly instead of silently using fewer GPUs.</li>
+      </ol>
+      <pre><code>uv run modal run iterate.py        <span class="tok-com"># runs tp, then sp, then tsp</span>
+uv run modal run iterate.py::ts    <span class="tok-com"># run just TSP</span></code></pre>
+
+      <div class="callout gotcha">
+        <span class="label">Real-world gremlins the sessions hit</span>
+        <p>Distributed GPU runs fail in ways local code never does: a <strong>NCCL NVLink/Fabric-Manager multicast error</strong> (fixed by setting <code>NCCL_NVLS_ENABLE=0</code>); workers <strong>interrupted during <code>import torch</code></strong> when three heavy jobs ran back-to-back (fixed by running TSP as its own job); and a missing <code>matplotlib</code> breaking the memory-timeline export. None are bugs in the algorithm — they're the texture of operating real multi-GPU infrastructure. Expect this layer to need its own debugging.</p>
+      </div>
+
+      <h2>Reading the output</h2>
+      <p>A run prints lines like:</p>
+      <pre><code>tp_attention max_rank_elapsed_ms=130.813
+peak_allocated=0.601562 GiB
+tensor-parallel causal attention completed</code></pre>
+      <p>That's one row of the tables you read in module 8: a mode, a latency (slowest rank), and a peak memory. Sweep over sequence lengths and head counts and you've reproduced the paper's measurements — which is the whole deliverable of the test.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Why compare the parallel output to a single-GPU reference instead of just trusting it because "it ran"?</summary>
+        <div class="answer">
+          <p>Because a parallel implementation can run to completion and still compute the <em>wrong</em> answer — a mis-sharded weight, a wrong collective, a bad causal offset. The single-GPU <code>attn</code> is simple enough to trust, so it serves as an oracle: if the parallel output matches it (within float tolerance), the sharding and collectives are correct. "It ran without crashing" proves nothing about correctness.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why is the reported latency the MAX across ranks, not the mean?</summary>
+        <div class="answer">
+          <p>Because the ranks run in lockstep through collectives — the whole step isn't done until the <em>slowest</em> rank finishes. End-to-end wall time is governed by the max-rank time. The mean is still tracked, but only to reveal load imbalance (e.g. the causal-imbalance problem from module 6); it's not the latency you'd actually experience.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why does the mature workflow separate correctness checks from profiling runs?</summary>
+        <div class="answer">
+          <p>Because computing the full dense reference attention on every rank is more expensive than the parallel implementation being measured — so leaving it in distorts the timing and inflates memory. You validate once on small shapes (cheap, decisive), then profile the real large shapes with validation disabled so the numbers reflect only the implementation. The repo's add/remove churn around the correctness checks was exactly this realization in motion.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

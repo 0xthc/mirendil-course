@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>03 · Attention & the transformer block</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 03</div>
+      <h1>Attention &amp; the transformer block</h1>
+      <p class="lede">You can't parallelize something you can't picture. This module gives you exactly enough of attention to follow the rest — focused on <em>shapes and data flow</em>, not the theory of why attention works.</p>
+
+      <h2>The vocabulary of shapes</h2>
+      <p>Almost every confusion in this whole topic is really a shape confusion. Learn these five letters and you're 80% of the way there. They appear constantly in the code and the paper.</p>
+      <table>
+        <thead><tr><th>Symbol</th><th>Name</th><th>Meaning</th><th>Example value in the test</th></tr></thead>
+        <tbody>
+          <tr><td><code>B</code></td><td>batch size</td><td>How many independent sequences we process at once.</td><td>1 or 8</td></tr>
+          <tr><td><code>S</code></td><td>sequence length</td><td>How many tokens are in each sequence.</td><td>8192 → 65536</td></tr>
+          <tr><td><code>H</code></td><td>hidden size</td><td>The width of each token's vector. Also called the model dimension / embedding dim / residual width.</td><td>2048 or 4096</td></tr>
+          <tr><td><code>num_heads</code></td><td>number of heads</td><td>Attention is split into this many parallel "heads".</td><td>16 or 32</td></tr>
+          <tr><td><code>head_dim</code> (<code>D</code>)</td><td>head dimension</td><td>The width each head works in. Always <code>H / num_heads</code>.</td><td>128</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout warn">
+        <span class="label">Heads-up on overloaded letters</span>
+        <p>The letter <code>D</code> is unfortunately used for two different things across the paper and code. In <em>attention</em>, <code>D</code> often means <strong>head_dim</strong>. In the <em>parallelism</em> discussion, <code>D</code> means the <strong>number of GPUs / parallel degree</strong>. Always check the context. This course writes <code>head_dim</code> when it means the head width, and <code>D</code> for the GPU count.</p>
+      </div>
+
+      <h3>A token is a vector of width H</h3>
+      <p>Your input <code>X</code> has shape <span class="shape">[B, S, H]</span>: a batch of <code>B</code> sequences, each <code>S</code> tokens long, each token being a vector of <code>H</code> numbers. That single tensor is the thing flowing through the whole network. Everything below transforms it and hands back something the same shape.</p>
+
+      <h2>The one matrix convention you must internalize</h2>
+      <p>In math textbooks you often see <code>y = W·x</code> (weight on the left, column vectors). PyTorch and this code use the opposite, <strong>row-vector</strong> convention:</p>
+      <pre><code>Y = X @ W.T        <span class="tok-com"># what F.linear(X, W) actually computes</span></code></pre>
+      <p>Concretely, <code>F.linear(X, W)</code> does <code>X @ W.transpose()</code>. So PyTorch stores a weight as <span class="shape">[out_features, in_features]</span> — output size first. This trips up everyone coming from a math background. Burn it in now:</p>
+
+      <div class="callout key">
+        <span class="label">Remember</span>
+        <p><code>F.linear(X, W)</code> with <code>X: [B, S, in]</code> and <code>W: [out, in]</code> produces <code>[B, S, out]</code>. The weight is stored <strong>output-first</strong>, and it gets transposed for you. When module 5 talks about slicing a weight's "rows" vs "columns", it means rows/columns of this <code>[out, in]</code> matrix.</p>
+      </div>
+
+      <h2>Attention, as a data-flow pipeline</h2>
+      <p>Forget the intuition about "tokens attending to each other" for a second and just trace the tensors. Here is the real reference implementation from <code>tensor_parallelism.py</code>, lightly annotated:</p>
+
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">attn</span>(X, W_q, W_k, W_v, W_o, num_heads):
+    B, S, H = X.shape
+    head_dim = H // num_heads
+
+    <span class="tok-com"># 1. Project X into three new tensors: Query, Key, Value.</span>
+    <span class="tok-com">#    Each projection is just a matrix multiply. q,k,v: [B, num_heads, S, head_dim]</span>
+    q = project_to_heads(F.linear(X, W_q), num_heads, head_dim)
+    k = project_to_heads(F.linear(X, W_k), num_heads, head_dim)
+    v = project_to_heads(F.linear(X, W_v), num_heads, head_dim)
+
+    <span class="tok-com"># 2. The attention operation itself. Causal = each token only sees</span>
+    <span class="tok-com">#    itself and earlier tokens. attn: [B, num_heads, S, head_dim]</span>
+    attn = F.scaled_dot_product_attention(q, k, v, is_causal=<span class="tok-key">True</span>)
+
+    <span class="tok-com"># 3. Glue the heads back together: [B, num_heads, S, head_dim] -> [B, S, H]</span>
+    attn = attn.transpose(1, 2).contiguous().view(B, S, H)
+
+    <span class="tok-com"># 4. One more projection (the "output projection"). out: [B, S, H]</span>
+    <span class="tok-key">return</span> F.linear(attn, W_o)</code></pre>
+
+      <p>Four steps. Notice the input was <span class="shape">[B, S, H]</span> and the output is <span class="shape">[B, S, H]</span> — same shape. Let's name what each step is for.</p>
+
+      <h3>Step 1 — Q, K, V projections</h3>
+      <p>Three separate weight matrices (<code>W_q</code>, <code>W_k</code>, <code>W_v</code>, each <span class="shape">[H, H]</span>) turn each token into three new vectors: a <strong>Query</strong> ("what am I looking for?"), a <strong>Key</strong> ("what do I offer?"), and a <strong>Value</strong> ("what information do I carry?"). Then we reshape <span class="shape">[B, S, H]</span> into <span class="shape">[B, num_heads, S, head_dim]</span> — we slice the width <code>H</code> into <code>num_heads</code> independent lanes. <strong>This slicing is exactly what TP will exploit.</strong></p>
+
+      <div class="callout gotcha">
+        <span class="label">A real question from the original sessions</span>
+        <p><em>"Why is Q/K/V in <code>[B, heads, S, head_dim]</code> and not <code>[B, S, heads, head_dim]</code>?"</em> — Because PyTorch's <code>scaled_dot_product_attention</code> (SDPA) expects the head axis right after the batch axis. You build it as <code>[B, S, heads, head_dim]</code> then <code>transpose(1, 2)</code> to swap <code>S</code> and <code>heads</code>. The heads become a "batch-like" dimension that SDPA processes in parallel.</p>
+      </div>
+
+      <h3>Step 2 — scaled dot-product attention (causal)</h3>
+      <p>This is the actual "attention". For each head, every query token compares itself against every key token, and uses those scores to take a weighted blend of the value vectors. <strong>Causal</strong> means a token at position <code>i</code> may only look at positions <code>0…i</code> (the past), never the future. <code>is_causal=True</code> applies that mask for you. The crucial fact for later: <em>a query for token i needs the keys/values of all tokens up to i</em>. Hold that thought — it's why SP is hard.</p>
+
+      <h3>Step 3 — concatenate heads</h3>
+      <p>Each head produced its own <code>head_dim</code>-wide output. We stitch them back side by side into a full <code>H</code>-wide vector per token. <code>transpose(1,2).view(B, S, H)</code> does the stitching.</p>
+
+      <h3>Step 4 — the output projection W_o</h3>
+      <p>One final matrix <code>W_o: [H, H]</code> mixes the concatenated head outputs back into the token's residual stream. This little step has a subtle role that <strong>module 5 spends real time on</strong>, because it's where most people's mental model of TP breaks. Plant a flag here.</p>
+
+      <h2>The MLP block (the easy sibling)</h2>
+      <p>After attention, each transformer block has a feed-forward network — the MLP. It's mercifully simple: two matrix multiplies with a nonlinearity between them, applied to each token <em>independently</em>.</p>
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">mlp</span>(X, W_in, W_out):
+    hidden = F.gelu(F.linear(X, W_in))   <span class="tok-com"># [B, S, H] -> [B, S, I]   (I = 4*H, "expansion")</span>
+    <span class="tok-key">return</span> F.linear(hidden, W_out)        <span class="tok-com"># [B, S, I] -> [B, S, H]</span></code></pre>
+      <p>The first matrix <strong>expands</strong> the width from <code>H</code> to an intermediate size <code>I</code> (typically <code>4·H</code>), applies GELU, then the second matrix <strong>contracts</strong> back to <code>H</code>. The key property: <strong>the MLP touches each token on its own</strong>. Token 5's output depends only on token 5's input. There's no cross-token mixing here (all the cross-token mixing happened in attention). This is why, as you'll see, the MLP is trivially easy to shard by tokens — no communication needed.</p>
+
+      <div class="callout analogy">
+        <span class="label">Mental model for the whole block</span>
+        <p><strong>Attention = the social step</strong> (tokens look at each other, needs coordination). <strong>MLP = the private step</strong> (each token thinks on its own, embarrassingly parallel). Every parallelism strategy in this course is easy on the MLP and interesting on attention — because attention is the only place GPUs are forced to talk.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>If H = 4096 and num_heads = 32, what is head_dim? And what shape is one Q tensor before SDPA?</summary>
+        <div class="answer">
+          <p><code>head_dim = H / num_heads = 4096 / 32 = <strong>128</strong></code>. The Q tensor is <span class="shape">[B, 32, S, 128]</span> — batch, heads, sequence, head_dim. The <code>32 × 128 = 4096</code> exactly reconstructs <code>H</code> when you concatenate the heads back together.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>You see W_q stored with shape [4096, 4096] and call F.linear(X, W_q) where X is [B, S, 4096]. What's the output shape, and what operation literally happened?</summary>
+        <div class="answer">
+          <p>Output is <span class="shape">[B, S, 4096]</span>. Literally <code>X @ W_q.T</code> — PyTorch transposes the weight (which is stored <code>[out, in]</code>) and matrix-multiplies. Here out = in = 4096, so the shape is unchanged, but in general the first dimension of the weight is the output width.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why is the MLP "embarrassingly parallel" across tokens but attention is not?</summary>
+        <div class="answer">
+          <p>The MLP computes each token's output purely from that same token's input — no token looks at any other. So you can hand different tokens to different GPUs and never need them to talk. Attention is the opposite: a query at position <code>i</code> must consult the keys and values of <em>all</em> tokens up to <code>i</code>. If those tokens live on other GPUs, the GPUs are forced to exchange data. That single difference is why every strategy is interesting only at the attention layer.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

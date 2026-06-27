@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>01 · The big picture</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 01</div>
+      <h1>The big picture</h1>
+      <p class="lede">Before any code: <em>why</em> does anyone split a neural network across multiple GPUs, and what are the three strategies the test is comparing?</p>
+
+      <h2>The problem in one sentence</h2>
+      <p>A modern transformer, while it runs, needs more memory than fits on a single GPU. So we cut the work into pieces, put each piece on a different GPU, and have the GPUs talk to each other to stitch the answer back together.</p>
+
+      <div class="callout analogy">
+        <span class="label">Analogy</span>
+        <p>Think of rendering a huge video. One machine can't hold the whole project in RAM, so you split it across a render farm. Each box renders some frames, then you collect the results. The hard part isn't the rendering — it's deciding <em>how to split</em> and <em>when the boxes have to exchange data</em>. That coordination is the entire subject of this course.</p>
+      </div>
+
+      <h2>Two completely different things eat your GPU memory</h2>
+      <p>This distinction is the key that unlocks everything else. When a transformer runs, GPU memory is consumed by two unrelated categories:</p>
+
+      <table>
+        <thead><tr><th>Category</th><th>What it is</th><th>What makes it grow</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Model state</strong></td><td>The <em>weights</em> (and during training, their gradients and optimizer state). These are the learned parameters — the matrices <code>W_q</code>, <code>W_k</code>, etc.</td><td>Bigger model (more layers, wider hidden size). <strong>Does not</strong> depend on how long your input is.</td></tr>
+          <tr><td><strong>Activations</strong></td><td>The intermediate tensors produced <em>while processing a specific input</em> — the Q/K/V tensors, the attention scores, etc. Scratch data, not learned.</td><td>Longer input sequence (more tokens) and bigger batch. <strong>Does not</strong> depend on having more weights.</td></tr>
+        </tbody>
+      </table>
+
+      <p>Here is why this split matters so much. Suppose you want to serve a model with a <strong>very long context</strong> — the report mentions models targeting 12 million tokens of context. The weights didn't change. But the activations explode, because attention has to deal with that many tokens at once. <strong>You can run out of memory from activations alone, even if the weights fit comfortably.</strong></p>
+
+      <div class="callout key">
+        <span class="label">The core insight</span>
+        <p>Different parallelism strategies attack different memory categories. If you only know one strategy, you can only relieve one kind of pressure. The whole point of the paper is a strategy that relieves <em>both at once</em>.</p>
+      </div>
+
+      <h2>The three strategies (a first, intuitive pass)</h2>
+      <p>You'll build each of these properly in later modules. For now, just get the shape of the idea.</p>
+
+      <h3>Tensor Parallelism (TP) — split the weights</h3>
+      <p>Cut each weight matrix into slices and give one slice to each GPU. Now no GPU holds a full weight matrix, so <strong>model-state memory shrinks</strong>. But every GPU still sees the <em>whole input sequence</em>, so activation memory is <em>not</em> reduced. Attention is computed by splitting it across <strong>attention heads</strong> — GPU 0 owns some heads, GPU 1 owns others.</p>
+
+      <h3>Sequence Parallelism (SP) — split the tokens</h3>
+      <p>Cut the input sequence into chunks of tokens and give one chunk to each GPU. Now no GPU holds the whole sequence's activations, so <strong>activation memory shrinks</strong>. But every GPU still keeps a <em>full copy of all the weights</em>, so model-state memory is <em>not</em> reduced. The catch: attention needs every token to "look at" every earlier token, so the GPUs must <em>exchange</em> their token chunks during attention.</p>
+
+      <h3>Tensor-Sequence Parallelism (TSP) — split both, on the same GPUs</h3>
+      <p>The paper's idea: fold both splits onto the <em>same</em> set of GPUs. Each GPU owns a slice of the weights <em>and</em> a chunk of the tokens. The aim is to shrink <strong>both</strong> model-state and activation memory at once, using the same 8 GPUs — instead of having to dedicate some GPUs to one job and some to the other.</p>
+
+      <div class="diagram">
+        <table style="margin:0">
+          <thead><tr><th>Strategy</th><th>Splits the…</th><th>Shrinks…</th><th>Leaves replicated…</th><th>Extra communication</th></tr></thead>
+          <tbody>
+            <tr><td><strong>TP</strong></td><td>weights (by head)</td><td>model state</td><td>activations (full sequence on every GPU)</td><td><code>all_reduce</code> after attention output</td></tr>
+            <tr><td><strong>SP</strong></td><td>tokens</td><td>activations</td><td>weights (full copy on every GPU)</td><td><code>all_gather</code> of K/V</td></tr>
+            <tr><td><strong>TSP</strong></td><td>both, folded</td><td>model state <em>and</em> activations</td><td>nothing fully</td><td>weight <code>broadcast</code> + K/V <code>all_gather</code></td></tr>
+          </tbody>
+        </table>
+        <div class="cap">The one-table summary of the entire course. You'll understand every cell by the end of module 7.</div>
+      </div>
+
+      <h2>What the test actually measures</h2>
+      <p>The experiment (from <code>report.md</code>) runs all three strategies on the same hardware and asks: does TSP really deliver lower peak memory, and is that worth the extra communication?</p>
+      <ul>
+        <li><strong>Hardware:</strong> 8× NVIDIA H100 GPUs.</li>
+        <li><strong>Knobs swept:</strong> sequence length (8K → 64K tokens), number of attention heads (16, 32).</li>
+        <li><strong>Measured:</strong> peak memory per GPU, and latency (time to run the attention region).</li>
+        <li><strong>Validated:</strong> each parallel implementation is checked against a plain single-GPU reference to prove it computes the same answer.</li>
+      </ul>
+      <p>A genuine spoiler from the results, so you know where this is heading: TSP <strong>does</strong> use the least peak memory, SP uses the most (because of how K/V gather was implemented), and TSP pays for its memory win with extra communication time. Module 8 reads the real numbers.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>A model's weights fit on one GPU, but you keep running out of memory at long context lengths. Which memory category is the culprit, and which strategy targets it?</summary>
+        <div class="answer">
+          <p><strong>Activations.</strong> Weights are fixed regardless of context length; it's the per-token intermediate tensors (especially in attention) that blow up as the sequence grows. <strong>Sequence Parallelism (SP)</strong> directly targets activation memory by sharding the token axis. (TSP would help too, since it shrinks both categories.)</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why isn't TP enough on its own for very long sequences?</summary>
+        <div class="answer">
+          <p>TP only shrinks <em>model-state</em> memory. Under TP, every GPU still holds the activations for the <em>entire</em> sequence. So as the sequence gets longer, every GPU's activation memory grows just as fast as it would on a single GPU — TP does nothing to stop that.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>In plain English, what is TSP trying to achieve that neither TP nor SP can alone?</summary>
+        <div class="answer">
+          <p>Shrinking <strong>both</strong> memory categories at once, on the <strong>same</strong> set of GPUs. TP shrinks weights but not activations; SP shrinks activations but not weights. TSP folds both reductions together so a single 8-GPU group gets both savings — at the cost of more data movement, which is the tradeoff module 8 examines.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

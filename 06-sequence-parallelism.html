@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · Sequence parallelism (SP)</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 06</div>
+      <h1>Sequence parallelism (SP)</h1>
+      <p class="lede">The mirror image of TP. Instead of splitting the weights, we split the <em>tokens</em>. Every GPU keeps a full copy of the weights but only handles a chunk of the sequence — which is exactly what kills activation memory.</p>
+
+      <h2>The core idea: split the token axis</h2>
+      <p>The input <code>X</code> is <span class="shape">[B, S, H]</span>. Under SP, we cut along <code>S</code>: with 8 GPUs and 8192 tokens, GPU 0 gets tokens 0–1023, GPU 1 gets tokens 1024–2047, and so on. Each GPU's local input is <span class="shape">[B, S/D, H]</span>.</p>
+      <p>We write <code>X_p</code> for the chunk held by sequence-rank <code>p</code>. Because activations scale with the number of tokens a GPU processes, and each GPU now processes only <code>S/D</code> tokens, <strong>activation memory drops by a factor of D</strong>. That's the win TP couldn't give.</p>
+
+      <div class="callout key">
+        <span class="label">Terminology cleanup (from the sessions)</span>
+        <p>Under SP, <code>X_p</code> is neither "row-parallel" nor "column-parallel" — those terms describe how you slice a 2D <em>weight</em> matrix. <code>X_p</code> is an <em>activation</em> sliced along the token axis, so the precise word is <strong>sequence-sharded</strong>. Use "batch-/sequence-/hidden-/head-sharded" for activations and save row/column-parallel for weights.</p>
+      </div>
+
+      <h2>Why attention suddenly gets hard</h2>
+      <p>The MLP under SP is trivial — recall it's token-independent. Each GPU runs the full MLP on its own token chunk and is done. <strong>No communication at all.</strong> (The original session confirmed exactly this: "for SP on MLP, there isn't any all_gather needed right? since it's token-wise" — correct.)</p>
+      <p>Attention is the problem. Remember causal attention: a query at token <code>i</code> must attend to the keys and values of <em>all tokens 0…i</em>. But under SP those earlier tokens live on <em>other GPUs</em>. GPU 1 holds queries for tokens 1024–2047, but to answer them it needs the keys/values for tokens 0–2047 — and tokens 0–1023 are on GPU 0.</p>
+
+      <div class="callout gotcha">
+        <span class="label">The crux</span>
+        <p>Local queries need <strong>global</strong> keys and values. Each GPU has only its local K/V chunk. So before computing attention, every GPU must collect everyone else's K/V chunks. That's an <code>all_gather</code> along the sequence axis.</p>
+      </div>
+
+      <h3>The K/V all_gather</h3>
+      <div class="diagram">
+        <div class="grid-shard" style="grid-template-columns:repeat(4,1fr);max-width:600px;margin:0 auto">
+          <div class="cell r0">GPU0<br>Q,K,V for<br>tok 0–2K</div>
+          <div class="cell r1">GPU1<br>Q,K,V for<br>tok 2–4K</div>
+          <div class="cell r2">GPU2<br>Q,K,V for<br>tok 4–6K</div>
+          <div class="cell r3">GPU3<br>Q,K,V for<br>tok 6–8K</div>
+        </div>
+        <div style="text-align:center;color:var(--accent);margin:10px 0;font-size:18px">↓ all_gather(K), all_gather(V) — keep local Q ↓</div>
+        <div class="grid-shard" style="grid-template-columns:repeat(4,1fr);max-width:600px;margin:0 auto">
+          <div class="cell r0">GPU0<br>Q: 0–2K<br>K,V: <strong>0–8K</strong></div>
+          <div class="cell r1">GPU1<br>Q: 2–4K<br>K,V: <strong>0–8K</strong></div>
+          <div class="cell r2">GPU2<br>Q: 4–6K<br>K,V: <strong>0–8K</strong></div>
+          <div class="cell r3">GPU3<br>Q: 6–8K<br>K,V: <strong>0–8K</strong></div>
+        </div>
+        <div class="cap">Queries stay local (each GPU answers its own tokens), but K and V are gathered to full length. Now each GPU can run causal attention for its query rows against the global K/V.</div>
+      </div>
+
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">sp_attn</span>(X_p, W_q, W_k, W_v, W_o, num_heads):
+    <span class="tok-com"># X_p is sequence-sharded: [B, S/D, H]. Weights are FULL (replicated).</span>
+    q_p = project_to_heads(F.linear(X_p, W_q), num_heads, head_dim)  <span class="tok-com"># [B, heads, S/D, head_dim]</span>
+    k_p = project_to_heads(F.linear(X_p, W_k), num_heads, head_dim)
+    v_p = project_to_heads(F.linear(X_p, W_v), num_heads, head_dim)
+
+    k = all_gather_seq(k_p)   <span class="tok-com"># [B, heads, S, head_dim]  — full sequence of keys</span>
+    v = all_gather_seq(v_p)   <span class="tok-com"># [B, heads, S, head_dim]  — full sequence of values</span>
+
+    attn_p = causal_attn(q_p, k, v)   <span class="tok-com"># local queries vs global K/V -> [B, heads, S/D, head_dim]</span>
+    <span class="tok-key">return</span> F.linear(attn_p, W_o)         <span class="tok-com"># [B, S/D, H]  — this rank's output tokens. No all_reduce!</span></code></pre>
+
+      <p>Notice the asymmetry with TP: SP's attention <strong>ends with no all_reduce</strong>. Each rank owns a <em>distinct set of output tokens</em>, so there's nothing to sum across ranks — every rank's output is final for its own tokens. The communication moved to the <em>middle</em> (the K/V gather) instead of the end.</p>
+
+      <h2>The causal mask under sharding — a real subtlety</h2>
+      <p>With <code>is_causal=True</code>, SDPA assumes query row <code>i</code> may see key columns <code>0…i</code>. But on GPU 1, local query row 0 is really <em>global</em> token 1024 — it should see keys 0…1024, not just key 0. So the mask has to account for the rank's offset into the global sequence. The original session flagged exactly this: "this causal masking is correct for tensor-sequence parallelism right?" — and the answer hinges on using <strong>rank-relative query positions against global key positions</strong>. Get the offset wrong and the model silently attends to the wrong tokens.</p>
+
+      <h2>Causal load imbalance (and the zigzag fix)</h2>
+      <p>Here's a slick problem that only shows up with causal attention + sequence sharding. If you split the sequence into <em>contiguous</em> chunks, the work is unbalanced:</p>
+      <ul>
+        <li>GPU 0 owns the <em>earliest</em> tokens. Token 100 attends to only ~100 keys. Light work.</li>
+        <li>GPU 7 owns the <em>latest</em> tokens. Token 8000 attends to ~8000 keys. Heavy work.</li>
+      </ul>
+      <p>Because attention cost grows with how many earlier tokens you attend to, the GPU with the last chunk does far more work — and everyone waits for the slowest GPU. The fix is <strong>zigzag / striped partitioning</strong>: instead of giving each GPU a contiguous block, interleave so each GPU gets a mix of early and late tokens. Then every GPU's total attention load is roughly equal.</p>
+
+      <div class="callout analogy">
+        <span class="label">Analogy</span>
+        <p>Splitting a book among 8 readers for a "summarize everything up to your page" task. If reader 8 gets the last chapter, they have to recall the whole book; reader 1 just needs page 1. Unfair. Instead, deal pages out like cards (1→A, 2→B, … 9→A, 10→B) so every reader has an even spread of early and late pages. Same total work, evenly shared.</p>
+      </div>
+
+      <h2>Try it: the shape calculator</h2>
+      <p>Compare the SP rows to the TP rows. Under SP, <code>X_p</code> is <code>[B, S/D, H]</code> — the sequence shrank. But the K/V <em>after gather</em> swell back to the full <code>S</code>, which is why this particular SP implementation actually used a lot of memory (more in module 8).</p>
+
+      <div class="calc">
+        <div class="inputs">
+          <div><label>B (batch)</label><input id="c-B" type="number" value="1" min="1"></div>
+          <div><label>S (seq len)</label><input id="c-S" type="number" value="8192" min="1"></div>
+          <div><label>H (hidden)</label><input id="c-H" type="number" value="4096" min="1"></div>
+          <div><label>num_heads</label><input id="c-heads" type="number" value="32" min="1"></div>
+          <div><label>D (GPUs)</label><input id="c-D" type="number" value="8" min="1"></div>
+        </div>
+        <div class="err"></div>
+        <div class="out"></div>
+      </div>
+
+      <div class="callout warn">
+        <span class="label">SP's blind spot</span>
+        <p>SP shrank activations but every GPU still stores <strong>all</strong> the weights. For a big model that's a lot of wasted replication. TP had the opposite blind spot. Each strategy fixes the other's weakness — which is the whole motivation for combining them.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Why does the SP MLP need no communication, but SP attention needs an all_gather?</summary>
+        <div class="answer">
+          <p>The MLP is token-independent: each token's output depends only on itself, so a GPU with tokens 0–1023 can fully compute their MLP outputs alone. Attention is token-<em>dependent</em>: a query token must attend to all earlier tokens' keys/values, which live on other GPUs — so the K/V chunks must be gathered (all_gather) before attention can run.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>TP attention ends with all_reduce; SP attention ends with no collective. Why the difference?</summary>
+        <div class="answer">
+          <p>In TP, every rank computes a partial of the <em>same</em> output tokens (row-parallel W_o), so the partials must be summed (all_reduce). In SP, every rank owns a <em>different, disjoint set</em> of output tokens, so each rank's output is already final and complete for its tokens — nothing to combine. SP's communication is in the middle (K/V gather), not at the end.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>You split an 8K causal sequence into 8 contiguous 1K chunks and notice GPU 7 is always the bottleneck. Why, and what's the fix?</summary>
+        <div class="answer">
+          <p>Causal attention cost grows with position: late tokens attend to far more earlier tokens than early tokens do. GPU 7 holds the latest 1K tokens, so it does the most attention work, and the whole step waits on it. Fix: <strong>zigzag/striped partitioning</strong> — interleave tokens so each GPU gets a balanced mix of early and late positions, equalizing the load.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

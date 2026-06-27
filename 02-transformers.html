@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>02 · How a transformer computes</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Module 02</div>
+      <h1>How a transformer computes</h1>
+      <p class="lede">The whole course rests on one distinction — <strong>weights vs. activations</strong>. To really feel it, you need to see what a transformer actually does to your input, end to end, and watch both kinds of numbers appear. No prior ML needed; if you can read a for-loop and a matrix multiply, you're ready.</p>
+
+      <h2>The one-sentence job of a transformer</h2>
+      <p>A language transformer does exactly one thing: <strong>given a sequence of tokens, predict the next token.</strong> Everything else — chat, code, summarization — is that single operation run over and over. "The cat sat on the ___" → "mat". That's it. The entire architecture below exists to compute that prediction well.</p>
+
+      <div class="callout analogy">
+        <span class="label">A mental model you already have</span>
+        <p>Think of the model as a giant pure function: <code>predict(tokens) → next_token_probabilities</code>. The <strong>weights</strong> are the millions of constants baked into that function (like a huge config file or lookup table loaded at startup). The <strong>activations</strong> are the local variables that exist only <em>while one call is running</em> — request-scoped scratch memory. Same split as a web server: the compiled code + loaded config is fixed; the per-request data comes and goes. Hold that analogy; it <em>is</em> the weights/activations distinction.</p>
+      </div>
+
+      <h2>Step 0 — Tokens: text becomes integers</h2>
+      <p>Text is first chopped into <strong>tokens</strong> (roughly word-pieces) and each is mapped to an integer ID. "The cat sat" might become <code>[464, 3797, 3332]</code>. A <strong>sequence</strong> of <code>S</code> tokens is just a list of <code>S</code> integers. If you process several sequences at once, that's the <strong>batch</strong> <code>B</code>. So the raw input is a grid of integers of shape <span class="shape">[B, S]</span>. Nothing learned yet — just indexing.</p>
+
+      <h2>Step 1 — Embedding: integers become vectors</h2>
+      <p>A neural network can't do math on the integer "3797". So we look each token ID up in a big table that maps every possible token to a vector of <code>H</code> numbers. That table is the <strong>embedding matrix</strong> <code>E</code>, shaped <span class="shape">[vocab_size, H]</span> — one row per possible token.</p>
+      <pre><code>vocab_size = 50000,  H = 4096
+E: [50000, 4096]          <span class="tok-com"># the lookup table — a WEIGHT (learned, fixed)</span>
+
+token id 3797  ->  E[3797]  ->  a vector of 4096 numbers</code></pre>
+      <p>Do that for every token in the input and you get your first activation tensor:</p>
+      <pre><code>X = E[token_ids]          <span class="tok-com"># shape [B, S, H] — an ACTIVATION (depends on the input)</span></code></pre>
+
+      <div class="callout key">
+        <span class="label">Your first weight and your first activation, side by side</span>
+        <p><code>E</code> (the <span class="shape">[50000, 4096]</span> table) is a <strong>weight</strong>: it's the same for every request, learned once during training, and its size depends only on the vocabulary and <code>H</code> — <em>not</em> on your input. <code>X</code> (the <span class="shape">[B, S, 4096]</span> result) is an <strong>activation</strong>: it only exists because you fed in a specific batch, and it grows when you add more tokens or more sequences. This is the whole distinction, in miniature.</p>
+      </div>
+
+      <h2>Step 2 — The residual stream: the data bus through the model</h2>
+      <p>From here on, <strong>that <code>[B, S, H]</code> tensor is the only thing flowing through the network.</strong> Every token is now a point in <code>H</code>-dimensional space (here <code>H = 4096</code>). The model's job is to nudge each token's vector, layer by layer, until it encodes enough context to predict what comes next. This flowing tensor is called the <strong>residual stream</strong>.</p>
+      <p>"Residual" because each layer doesn't <em>replace</em> the stream — it computes an <em>update</em> and adds it on:</p>
+      <pre><code>X = X + attention(X)      <span class="tok-com"># add what attention learned</span>
+X = X + mlp(X)            <span class="tok-com"># add what the MLP learned</span></code></pre>
+      <p>Think of it as a shared mutable buffer that each layer reads from and writes a correction back into. The shape <span class="shape">[B, S, H]</span> never changes as it passes through — only the values do.</p>
+
+      <h2>Step 3 — A transformer is just N identical blocks stacked</h2>
+      <p>The model body is a loop. You apply the <em>same kind of block</em> <code>L</code> times (the test's reference model has <code>L = 32</code> layers). Each block has its own private copy of the weights, but the structure is identical:</p>
+      <pre><code>X = embed(token_ids)              <span class="tok-com"># [B, S, H]</span>
+<span class="tok-key">for</span> layer <span class="tok-key">in</span> range(L):           <span class="tok-com"># L = 32 blocks</span>
+    X = X + attention_layer(X)    <span class="tok-com"># the "social" step (module 3)</span>
+    X = X + mlp_layer(X)          <span class="tok-com"># the "private" step</span>
+logits = X @ E.T                  <span class="tok-com"># project back to vocab -> next-token scores</span></code></pre>
+      <p>So the famous "transformer" is, structurally, an embedding lookup, then 32 repetitions of {attention, then MLP}, then a projection back out to vocabulary scores. Two matrix-heavy sub-layers per block. <strong>Module 3 unpacks attention; the MLP we'll do right here</strong> because it's the cleanest place to count weights and activations.</p>
+
+      <h2>Step 4 — The MLP, computed by hand</h2>
+      <p>The MLP (feed-forward network) is two matrix multiplies with a nonlinearity between them. It processes each token independently. Here are its weights:</p>
+      <pre><code>H = 4096,  I = 4 * H = 16384      <span class="tok-com"># I = intermediate ("expansion") size</span>
+
+W_in:  [I, H] = [16384, 4096]     <span class="tok-com"># WEIGHT — expands the width</span>
+W_out: [H, I] = [4096, 16384]     <span class="tok-com"># WEIGHT — contracts it back</span></code></pre>
+      <p>And here's the computation on the residual stream <code>X: [B, S, H]</code>. Watch the shapes — and notice the <em>new</em> activation that appears in the middle:</p>
+      <pre><code>hidden = gelu(X @ W_in.T)    <span class="tok-com"># [B,S,4096] @ [4096,16384] -> [B, S, 16384]   ACTIVATION</span>
+out    = hidden @ W_out.T    <span class="tok-com"># [B,S,16384] @ [16384,4096] -> [B, S, 4096]   ACTIVATION</span></code></pre>
+      <p>(Recall from the matrix convention we'll formalize in module 3: <code>F.linear(X, W)</code> computes <code>X @ W.T</code>, and weights are stored output-first as <span class="shape">[out, in]</span>.)</p>
+
+      <div class="callout key">
+        <span class="label">Read the two kinds of numbers in this block</span>
+        <p><strong>Weights</strong> here: <code>W_in</code> and <code>W_out</code>. Their sizes — <code>16384×4096</code> each — depend only on <code>H</code> and <code>I</code>. Feed in 10 tokens or 10 million; these matrices are byte-for-byte identical. <strong>Activations</strong> here: <code>hidden</code> and <code>out</code>. Their sizes — <code>[B, S, …]</code> — scale directly with how many tokens you pushed through. Double the sequence, double these tensors. <em>This is why long context blows up activation memory but not weight memory.</em></p>
+      </div>
+
+      <h2>Counting it out: where the memory actually goes</h2>
+      <p>Abstract until you put numbers on it. Let's use the test's reference scale: <code>H = 4096</code>, <code>I = 16384</code>, <code>L = 32</code> layers. (Numbers are in parameters/elements; multiply by 2 bytes for bf16, or 4 for fp32, to get bytes.)</p>
+
+      <h3>Weights (model state) — fixed, independent of input</h3>
+      <table>
+        <thead><tr><th>Weight (per layer)</th><th>Shape</th><th>Parameters</th></tr></thead>
+        <tbody>
+          <tr><td>W_q, W_k, W_v, W_o (attention)</td><td>4 × [4096, 4096]</td><td>~67 M</td></tr>
+          <tr><td>W_in, W_out (MLP)</td><td>2 × [16384, 4096]</td><td>~134 M</td></tr>
+          <tr><td><strong>Per layer total</strong></td><td>—</td><td><strong>~201 M</strong></td></tr>
+          <tr><td><strong>× 32 layers</strong></td><td>—</td><td><strong>~6.4 B parameters</strong></td></tr>
+        </tbody>
+      </table>
+      <p>Notice what's <em>absent</em> from this table: <code>B</code> and <code>S</code>. The parameter count has nothing to do with your input length. A 6.4-billion-parameter model is 6.4B parameters whether you prompt it with 5 tokens or 50,000. <strong>That's model-state memory — and it's what Tensor Parallelism (module 5) shrinks by slicing these matrices across GPUs.</strong></p>
+
+      <h3>Activations — scale with batch and sequence</h3>
+      <p>Now the other axis. Just the MLP's <code>hidden</code> tensor, for one layer, at the test's <code>B=1</code>:</p>
+      <pre><code>hidden: [B, S, I] = [1, S, 16384]
+  S =  8192  ->  ~134 M elements   (~0.27 GB in bf16)
+  S = 65536  ->  ~1.07 B elements  (~2.1 GB in bf16)   <span class="tok-com"># just ONE tensor, ONE layer!</span></code></pre>
+      <p>Eight times the tokens, eight times the activation memory — and that's a single intermediate tensor. Add up Q, K, V, attention scores, <code>hidden</code>, and the residual stream across all layers and the activation footprint becomes enormous at long context. <strong>That's activation memory — and it's what Sequence Parallelism (module 6) shrinks by splitting the <code>S</code> axis across GPUs.</strong></p>
+
+      <div class="callout warn">
+        <span class="label">The punchline that sets up the whole course</span>
+        <p>Two memory bills, two completely different drivers. <strong>Weights</strong> are driven by model size (<code>H</code>, <code>I</code>, <code>L</code>, vocab) and are constant per request. <strong>Activations</strong> are driven by workload size (<code>B</code>, <code>S</code>) and vanish when the request ends. You can be crushed by either one independently — and each parallelism strategy in this course targets one or both. Keep this table in your head; module 8 is literally measuring these two quantities on real GPUs.</p>
+      </div>
+
+      <h2>One token's journey (the whole thing in plain words)</h2>
+      <ol>
+        <li>The word "cat" → token id <code>3797</code> (just an integer).</li>
+        <li>Look it up in embedding table <code>E</code> → a 4096-number vector. It joins the residual stream <code>X</code>.</li>
+        <li>Layer 1 attention: "cat" looks at the earlier tokens, gathers context ("the", subject position…), and <em>adds</em> an update to its vector.</li>
+        <li>Layer 1 MLP: "cat"'s vector is transformed on its own and an update is <em>added</em>.</li>
+        <li>Repeat for 32 layers — each one refines the vector with more context.</li>
+        <li>Final vector → multiply by <code>E.T</code> → a score for every possible next token → highest score wins ("sat", maybe).</li>
+      </ol>
+      <p>Every "look up", "add an update", and "transform" above is a matrix multiply between an <strong>activation</strong> (the stream) and a <strong>weight</strong> (a learned matrix). That's the entire machine. Now you're ready to open up the most interesting sub-layer — attention — in module 3.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Classify each as a weight or an activation: (a) the embedding table E, (b) the residual stream X, (c) W_in, (d) the MLP's hidden tensor.</summary>
+        <div class="answer">
+          <p><strong>(a) E — weight.</strong> Learned lookup table; size depends on vocab and H, not on input. <strong>(b) X — activation.</strong> Exists only for a specific batch; shape <code>[B,S,H]</code> scales with input. <strong>(c) W_in — weight.</strong> Learned <code>[I,H]</code> matrix, constant per request. <strong>(d) hidden — activation.</strong> Produced during a forward pass; shape <code>[B,S,I]</code> scales with input. Rule of thumb: if its shape contains <code>B</code> or <code>S</code>, it's an activation.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>You double the sequence length from 8K to 16K tokens. Which grows — the parameter count, the activation memory, both, or neither? Why?</summary>
+        <div class="answer">
+          <p>Only <strong>activation memory</strong> grows (it roughly doubles). The parameter count is a property of the matrices' shapes (<code>H</code>, <code>I</code>, <code>L</code>, vocab) and is completely independent of how many tokens you process. Activations carry a <code>S</code> dimension, so they scale directly with sequence length. This asymmetry is exactly why a model whose weights fit fine can still OOM on long inputs.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>What does "residual stream" mean, and why does the tensor keep the shape [B, S, H] through all 32 layers?</summary>
+        <div class="answer">
+          <p>The residual stream is the running <code>[B,S,H]</code> tensor that flows through the model — each token's evolving vector. Layers don't replace it; they compute an <em>update</em> and <em>add</em> it back (<code>X = X + sublayer(X)</code>). Because every sub-layer maps <code>[B,S,H]</code> to a same-shaped update that's added on, the stream's shape is invariant — only its values change. That's also why you can stack identical blocks: each one takes and returns the same shape.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>In the MLP, W_in is [16384, 4096] and hidden is [B, S, 16384]. If a GPU is short on memory, which of these could you shrink by adding more GPUs, and which technique targets which?</summary>
+        <div class="answer">
+          <p>Both, but via different strategies. <code>W_in</code> is a <em>weight</em> — slice it across GPUs with <strong>Tensor Parallelism</strong> (each GPU holds part of the <code>[16384, 4096]</code> matrix). <code>hidden</code> is an <em>activation</em> with an <code>S</code> axis — shrink it with <strong>Sequence Parallelism</strong> (each GPU processes only some of the tokens, so its <code>hidden</code> is <code>[B, S/D, 16384]</code>). TSP does both at once. You've just previewed modules 5–7.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>
