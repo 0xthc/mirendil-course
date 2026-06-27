@@ -14,6 +14,11 @@
       <h1>Tensor parallelism (TP)</h1>
       <p class="lede">The first real strategy. Split the weights across GPUs so no GPU holds a full weight matrix. The whole sequence stays replicated everywhere. We shard attention by <em>heads</em>.</p>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>A thick novel needs proofreading, and attention already splits the job into independent "heads" who never talk to each other. So hand each proofreader (GPU) a different stack of chapters. Nobody needs the whole book; each keeps only their stack. That's tensor parallelism — slice the <em>work and the weights</em> by head. The catch: at the very end you have to staple everyone's corrections back into one book, and that stapling is a quick all-to-all sum.</p>
+      </div>
+
       <h2>The core idea: heads are already independent</h2>
       <p>Recall from module 3 that attention runs <code>num_heads</code> heads in parallel — each head does its own little attention in its own <code>head_dim</code>-wide lane, and the results are concatenated at the end. The heads <strong>never talk to each other</strong> inside attention. That independence is a gift: we can just give different heads to different GPUs.</p>
       <p>With 8 GPUs and 32 heads, each GPU owns <code>32 / 8 = 4</code> heads. GPU 0 computes heads 0–3, GPU 1 computes heads 4–7, and so on. Each GPU does <code>1/8</code> of the attention work and stores <code>1/8</code> of the Q/K/V weights.</p>
@@ -27,6 +32,10 @@
         </div>
         <div class="cap">Head sharding (showing 4 of 8 GPUs). The input X is fully replicated on every GPU; only the heads — and the weights that produce them — are divided.</div>
       </div>
+
+      <div class="viz" data-viz="shard" data-mode="tp"
+        data-title="TP on 4 GPUs — toggle to compare with SP and TSP"
+        data-cap=""></div>
 
       <h2>Column-parallel vs row-parallel: the only hard part</h2>
       <p>Here's the question that generated the most back-and-forth in the original sessions: <em>Q/K/V and the output projection W_o are all square <code>[H, H]</code> matrices — why can't I shard them the same way?</em> The answer is that they sit on <strong>opposite sides</strong> of the attention operation, so they must be sliced along <strong>different axes</strong>.</p>

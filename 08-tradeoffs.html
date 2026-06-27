@@ -14,6 +14,11 @@
       <h1>Tradeoffs &amp; when to use what</h1>
       <p class="lede">Now the engineering judgment. We'll reason about memory scaling first, then read the test's actual numbers — which tell an honest, non-obvious story.</p>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>There's no free lunch. TSP is like vacuum-packing your suitcase: it fits in way less space, but you spend extra time squeezing the air out every time you pack and unpack. TP is the roomy suitcase — fast to use, but takes more space. The charts below show this with the test's real numbers: TSP's bar is shortest on the memory chart and tallest on the time chart.</p>
+      </div>
+
       <h2>Memory scaling, as formulas</h2>
       <p>Let <code>D</code> be your total GPU count. The two memory categories from module 1 scale differently under each strategy:</p>
       <table>
@@ -53,6 +58,14 @@
           <tr><td>64K</td><td>14.10 GiB</td><td>22.09 GiB</td><td><strong>13.42 GiB</strong></td></tr>
         </tbody>
       </table>
+      <div class="viz" data-viz="barchart"
+        data-title="Peak memory per GPU (lower is better)"
+        data-sub="The attention region, from report.md. TSP is shortest everywhere; SP is tallest."
+        data-groups='["8K","16K","32K","64K"]'
+        data-series='[{"name":"TP","color":"#57b6f5","values":[1.85,3.60,7.10,14.10]},{"name":"SP","color":"#f0c674","values":[2.84,5.59,11.09,22.09]},{"name":"TSP","color":"#5fd38a","values":[1.58,3.07,6.14,13.42]}]'
+        data-unit=" GiB"
+        data-cap="Green (TSP) is lowest at every sequence length — the paper's central claim, reproduced. Yellow (SP) is highest, because this implementation gathers the whole K/V sequence onto every GPU."></div>
+
       <p><strong>TSP wins on peak memory at every size</strong> — exactly the paper's claim. Two more things jump out:</p>
       <ul>
         <li><strong>SP uses the <em>most</em> memory</strong>, not the least. Counterintuitive! The cause is the implementation choice flagged in the report: SP gathers the <em>full</em> K/V sequence onto every rank (<code>all_gather</code>), so each GPU temporarily holds the entire sequence's keys and values — a big buffer. The report names the fix as future work: <em>ring-attention</em>, which streams K/V instead of materializing all of it.</li>
@@ -69,6 +82,14 @@
           <tr><td>64K</td><td>32</td><td><strong>583 ms</strong></td><td>1733 ms</td><td>1893 ms</td></tr>
         </tbody>
       </table>
+      <div class="viz" data-viz="barchart"
+        data-title="Latency — slowest-rank time for the attention region (lower is better)"
+        data-sub="Same runs. Now the picture flips: TP is fastest, TSP pays for its memory win in time."
+        data-groups='["8K","16K","32K","64K"]'
+        data-series='[{"name":"TP","color":"#57b6f5","values":[19,53,139,583]},{"name":"SP","color":"#f0c674","values":[61,149,450,1733]},{"name":"TSP","color":"#5fd38a","values":[35,123,285,1893]}]'
+        data-unit=" ms"
+        data-cap="Compare this to the memory chart above: the strategy with the <strong>shortest memory bar</strong> (TSP, green) has among the <strong>tallest time bars</strong>. That trade — space for time — is the whole engineering decision."></div>
+
       <p><strong>TP is consistently the fastest.</strong> It does the least communication and keeps full compute parallelism. TSP and SP are much slower because of their gather/broadcast traffic — and TSP's un-overlapped weight broadcasts make it the slowest at the largest size. This is the honest tradeoff in one picture: <strong>TSP buys the lowest memory and pays for it in time.</strong></p>
 
       <div class="callout warn">

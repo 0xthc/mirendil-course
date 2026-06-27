@@ -1,0 +1,104 @@
+/* ============================================================
+   Mirendil TSP Course — visualization toolkit styles
+   Loaded automatically by course.js
+   ============================================================ */
+
+/* ---------- ELI5 callout ---------- */
+.callout.eli5 {
+  border-left: 4px solid var(--purple);
+  background: #1d1830;
+}
+.callout.eli5 .label { color: var(--purple); }
+.callout.eli5 .label::before { content: "🧸 "; }
+
+/* ---------- Generic widget frame ---------- */
+.viz {
+  margin: 26px 0;
+  padding: 20px;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+.viz .viz-title { font-weight: 700; color: var(--text-bright); font-size: 15px; margin-bottom: 4px; }
+.viz .viz-sub { color: var(--text-dim); font-size: 13.5px; margin-bottom: 16px; }
+.viz .viz-cap { color: var(--text-dim); font-size: 13px; text-align: center; margin-top: 14px; line-height: 1.5; }
+
+.viz .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 14px 0; }
+.viz button.btn {
+  background: var(--bg-card); color: var(--text-bright); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 14px; font-size: 14px; cursor: pointer; font-family: var(--sans);
+  transition: border-color .15s, background .15s;
+}
+.viz button.btn:hover { border-color: var(--accent); }
+.viz button.btn.primary { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.viz button.btn:disabled { opacity: .4; cursor: not-allowed; }
+.viz .seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.viz .seg button { background: var(--bg-card); color: var(--text-dim); border: none; border-right: 1px solid var(--border); padding: 7px 13px; cursor: pointer; font-size: 13.5px; font-family: var(--sans); }
+.viz .seg button:last-child { border-right: none; }
+.viz .seg button.on { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+
+.viz .step-label { font-family: var(--mono); font-size: 13px; color: var(--amber); min-height: 20px; margin-top: 6px; }
+
+/* ---------- Slider rows ---------- */
+.viz .slider-row { display: grid; grid-template-columns: 120px 1fr 90px; align-items: center; gap: 12px; margin: 10px 0; }
+.viz .slider-row label { font-size: 13.5px; color: var(--text-dim); }
+.viz .slider-row .val { font-family: var(--mono); color: var(--accent); font-size: 14px; text-align: right; }
+.viz input[type=range] { width: 100%; accent-color: var(--accent); }
+
+/* ---------- Bar chart (SVG) ---------- */
+.viz svg { display: block; width: 100%; height: auto; overflow: visible; }
+.viz .bar { transition: height .5s ease, y .5s ease; cursor: pointer; }
+.viz .bar:hover { filter: brightness(1.2); }
+.viz .axis line, .viz .axis path { stroke: var(--border); }
+.viz .axis text, .viz .tick text { fill: var(--text-dim); font-size: 11px; font-family: var(--mono); }
+.viz .glabel { fill: var(--text-dim); font-size: 11.5px; }
+.viz .vlabel { fill: var(--text); font-size: 10.5px; font-family: var(--mono); }
+.viz .legend-row { display: flex; gap: 16px; justify-content: center; flex-wrap: wrap; margin-top: 12px; font-size: 13px; color: var(--text-dim); }
+.viz .legend-row span { display: inline-flex; align-items: center; gap: 6px; }
+.viz .legend-row .sw { width: 13px; height: 13px; border-radius: 3px; }
+
+/* color tokens reused by JS */
+:root {
+  --c-tp: #57b6f5;
+  --c-sp: #f0c674;
+  --c-tsp: #5fd38a;
+  --c-weight: #c099f0;
+  --c-act: #f0986b;
+}
+
+/* ---------- GPU / rank boxes for collective animations ---------- */
+.gpu-row { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; margin: 8px 0; }
+.gpu {
+  width: 92px; min-height: 92px; border-radius: 10px; border: 1px solid var(--border);
+  background: var(--bg-card); display: flex; flex-direction: column; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 12px; gap: 6px; transition: all .45s ease; position: relative;
+}
+.gpu .gpu-name { color: var(--text-dim); font-size: 11px; }
+.gpu .chip { padding: 3px 8px; border-radius: 6px; font-size: 12px; line-height: 1.3; }
+.gpu.flash { box-shadow: 0 0 0 2px var(--accent); }
+.chip.a { background: #16344d; color: #8fd0ff; }
+.chip.b { background: #1f3a23; color: #98e8ad; }
+.chip.c { background: #3a2a16; color: #f0c674; }
+.chip.d { background: #331f3a; color: #d6a9f0; }
+.chip.full { background: linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a); color: #fff; }
+.chip.empty { background: transparent; border: 1px dashed var(--border); color: var(--text-dim); }
+.chip.sum { background: #2a1f3a; color: #d6a9f0; }
+
+/* ---------- Attention heatmap ---------- */
+.attn-grid { display: grid; gap: 2px; justify-content: center; margin: 4px auto; }
+.attn-cell { width: 26px; height: 26px; border-radius: 3px; display: flex; align-items: center; justify-content: center; font-size: 9px; font-family: var(--mono); cursor: pointer; transition: transform .1s; }
+.attn-cell:hover { transform: scale(1.15); z-index:2; }
+.attn-cell.masked { background: #14181f; color: #3a4350; }
+.attn-cell.q { outline: 2px solid var(--accent); outline-offset: -2px; }
+.attn-axis-x, .attn-axis-y { font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.attn-legend { font-size: 12.5px; color: var(--text-dim); text-align:center; margin-top:10px; }
+
+/* ---------- Sharding grid ---------- */
+.shard-wrap { display: grid; gap: 6px; justify-content: center; margin: 6px 0; }
+.shard-box { padding: 12px 8px; border-radius: 8px; font-family: var(--mono); font-size: 12px; text-align: center; border: 1px solid var(--border); transition: all .4s; }
+
+@media (max-width: 560px) {
+  .viz .slider-row { grid-template-columns: 90px 1fr 64px; }
+  .gpu { width: 72px; min-height: 72px; }
+  .attn-cell { width: 20px; height: 20px; }
+}

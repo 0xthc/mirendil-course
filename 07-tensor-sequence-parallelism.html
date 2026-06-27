@@ -14,6 +14,11 @@
       <h1>Tensor-sequence parallelism (TSP)</h1>
       <p class="lede">The paper's contribution and the heart of the test. Fold <em>both</em> the weight split and the token split onto the <em>same</em> GPUs, so a single 8-GPU group shrinks model-state and activation memory together.</p>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>TP gave each chef some recipes; SP gave each reader some pages. TSP asks the <em>same</em> people to do both jobs at once: each GPU holds some pages <em>and</em> some recipes. The clever, cheap part is you don't need extra GPUs. The price: since each GPU only owns <em>some</em> of the recipes, the recipes have to be passed around the table like batons in a relay so every GPU can apply all of them to its pages. Less memory, more passing-around.</p>
+      </div>
+
       <h2>TSP vs "TP + SP" — get this distinction first</h2>
       <p>There are two ways to combine the two ideas, and they are <strong>not</strong> the same. This caused real confusion in the sessions, so we'll be explicit.</p>
 
@@ -56,6 +61,10 @@
         <p>Rank 0 holds sequence-shard 0 but only head-shard 0's weights. To produce the <em>full</em> output for its tokens, rank 0 needs <em>every</em> head shard applied to its tokens — including head shards it doesn't own. So TSP <strong>loops over all weight (head) shards</strong>, circulating each shard to every rank in turn. That loop is the cost of folding two axes onto one set of GPUs.</p>
       </div>
 
+      <div class="viz" data-viz="shard" data-mode="tsp"
+        data-title="TSP on 4 GPUs — toggle back to TP and SP to see what's combined"
+        data-cap=""></div>
+
       <h2>Algorithm 1: TSP attention, line by line</h2>
       <p>This is the implementation target from the paper. <code>r</code> is the weight-owner index (which head shard we're currently processing); <code>p</code> is this rank's sequence-shard. We accumulate the output for our local tokens, <code>Y_p</code>, across all weight shards.</p>
 
@@ -82,6 +91,10 @@
           <tr><td><code>Y_p</code> (accumulated)</td><td><span class="shape">[B, S/D, H]</span></td><td>final output for my tokens</td></tr>
         </tbody>
       </table>
+
+      <div class="viz" data-viz="collective" data-op="broadcast"
+        data-title="The weight-shard relay (one iteration of the loop)"
+        data-sub="Each pass of the loop broadcasts one weight shard so every GPU can apply it to its own tokens. Press Run, then imagine this repeating D times — a different shard each round."></div>
 
       <h2>The two "aha"s that took real correction</h2>
 

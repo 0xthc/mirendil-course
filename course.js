@@ -118,6 +118,18 @@ function wireCalc() {
   renderCalc(el);
 }
 
+/* ---- Auto-load the visualization toolkit on every page ---- */
+(function loadViz() {
+  const link = document.createElement("link");
+  link.rel = "stylesheet";
+  link.href = "viz.css";
+  document.head.appendChild(link);
+  const s = document.createElement("script");
+  s.src = "viz.js";
+  s.defer = true;
+  document.head.appendChild(s);
+})();
+
 document.addEventListener("DOMContentLoaded", () => {
   const layout = document.querySelector(".layout");
   if (layout) layout.insertAdjacentHTML("afterbegin", buildSidebar());

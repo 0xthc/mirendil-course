@@ -45,6 +45,11 @@
         <p><code>F.linear(X, W)</code> with <code>X: [B, S, in]</code> and <code>W: [out, in]</code> produces <code>[B, S, out]</code>. The weight is stored <strong>output-first</strong>, and it gets transposed for you. When module 5 talks about slicing a weight's "rows" vs "columns", it means rows/columns of this <code>[out, in]</code> matrix.</p>
       </div>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Each word raises its hand and asks: "who here is relevant to me?" Every other word answers, and the asking word listens <em>more</em> to the relevant answers and <em>less</em> to the rest — then updates its own understanding. "It" might listen hard to "cat" and ignore "the". Do that for every word at once and you have attention. <strong>Causal</strong> just means you may only ask words that came <em>before</em> you — no peeking at the future.</p>
+      </div>
+
       <h2>Attention, as a data-flow pipeline</h2>
       <p>Forget the intuition about "tokens attending to each other" for a second and just trace the tensors. Here is the real reference implementation from <code>tensor_parallelism.py</code>, lightly annotated:</p>
 
@@ -70,6 +75,19 @@
 
       <p>Four steps. Notice the input was <span class="shape">[B, S, H]</span> and the output is <span class="shape">[B, S, H]</span> — same shape. Let's name what each step is for.</p>
 
+      <div class="viz" data-viz="flow"
+        data-title="The shapes, one step at a time"
+        data-sub="Using H=4096, num_heads=32, head_dim=128. Step through and watch the tensor change shape, then come back to [B, S, H]."
+        data-steps='[
+          {"op":"input X","shape":"[B, S, 4096]","note":"The residual stream coming in — one 4096-vector per token."},
+          {"op":"project to Q/K/V, split into heads","shape":"[B, 32, S, 128]","note":"Three of these (Q, K, V). The width 4096 is sliced into 32 heads × 128."},
+          {"op":"scaled_dot_product_attention","shape":"[B, 32, S, 128]","note":"Each head blends value vectors by relevance. Same shape out."},
+          {"op":"concatenate heads","shape":"[B, S, 4096]","note":"Glue the 32 heads back side by side: 32 × 128 = 4096."},
+          {"op":"output projection W_o","shape":"[B, S, 4096]","note":"Mix head outputs back into the residual stream. Back to the shape we started with."}
+        ]'
+        data-cap="In, out, same shape — that invariance is what lets you stack 32 of these blocks."></div>
+
+
       <h3>Step 1 — Q, K, V projections</h3>
       <p>Three separate weight matrices (<code>W_q</code>, <code>W_k</code>, <code>W_v</code>, each <span class="shape">[H, H]</span>) turn each token into three new vectors: a <strong>Query</strong> ("what am I looking for?"), a <strong>Key</strong> ("what do I offer?"), and a <strong>Value</strong> ("what information do I carry?"). Then we reshape <span class="shape">[B, S, H]</span> into <span class="shape">[B, num_heads, S, head_dim]</span> — we slice the width <code>H</code> into <code>num_heads</code> independent lanes. <strong>This slicing is exactly what TP will exploit.</strong></p>
 
@@ -80,6 +98,8 @@
 
       <h3>Step 2 — scaled dot-product attention (causal)</h3>
       <p>This is the actual "attention". For each head, every query token compares itself against every key token, and uses those scores to take a weighted blend of the value vectors. <strong>Causal</strong> means a token at position <code>i</code> may only look at positions <code>0…i</code> (the past), never the future. <code>is_causal=True</code> applies that mask for you. The crucial fact for later: <em>a query for token i needs the keys/values of all tokens up to i</em>. Hold that thought — it's why SP is hard.</p>
+
+      <div class="viz" data-viz="attention" data-n="8"></div>
 
       <h3>Step 3 — concatenate heads</h3>
       <p>Each head produced its own <code>head_dim</code>-wide output. We stitch them back side by side into a full <code>H</code>-wide vector per token. <code>transpose(1,2).view(B, S, H)</code> does the stitching.</p>

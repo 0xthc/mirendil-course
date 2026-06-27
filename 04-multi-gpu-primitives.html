@@ -47,69 +47,32 @@ torchrun --standalone --nproc_per_node=8 tensor_parallelism.py</code></pre>
         <p><code>backend="nccl"</code> selects NVIDIA's Collective Communications Library — the thing that actually moves tensors GPU-to-GPU over fast links (NVLink). You never call NCCL directly; you call the <code>dist.*</code> collectives below and NCCL does the wire-level work. (On CPU-only test runs the repo uses the <code>gloo</code> backend instead.)</p>
       </div>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Picture 8 identical chefs, each at their own cooking station, all following the same recipe card. They can't read each other's minds — when one needs something from another, they have to <em>shout in unison</em> using one of exactly three calls: "everyone copy mine!" (broadcast), "everyone add yours to the pile and take a copy of the total!" (all_reduce), or "everyone show your piece so we all see the whole thing!" (all_gather). If one chef forgets to shout when the others do, the whole kitchen freezes waiting for them. That's the entire job.</p>
+      </div>
+
       <h2>The three collectives — your entire toolbox</h2>
       <p>Astonishingly, the whole course is built from just three communication operations. A <strong>collective</strong> is an operation that <em>every rank calls together</em>. Each one answers a different question: "how do I share data across ranks?"</p>
 
       <h3>broadcast — one-to-all</h3>
       <p>One rank has a tensor; everyone else gets an identical copy.</p>
-      <div class="diagram">
-        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
-          <div class="cell r0">rank0<br>[ABCD]</div>
-          <div class="cell empty">rank1<br>[ ? ]</div>
-          <div class="cell empty">rank2<br>[ ? ]</div>
-          <div class="cell empty">rank3<br>[ ? ]</div>
-        </div>
-        <div style="text-align:center;color:var(--accent);margin:8px 0;font-size:20px">↓ broadcast(src=0) ↓</div>
-        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
-          <div class="cell r0">rank0<br>[ABCD]</div>
-          <div class="cell r0">rank1<br>[ABCD]</div>
-          <div class="cell r0">rank2<br>[ABCD]</div>
-          <div class="cell r0">rank3<br>[ABCD]</div>
-        </div>
-        <div class="cap">Used at setup to give every GPU the same starting weights, and in TSP to circulate weight shards during the forward pass.</div>
-      </div>
+      <div class="viz" data-viz="collective" data-op="broadcast"
+        data-sub="Press Run. Used at setup to give every GPU the same starting weights, and in TSP to circulate weight shards during the forward pass."></div>
       <pre><code>dist.broadcast(tensor, src=0)   <span class="tok-com"># rank 0 fills tensor; all others receive into it</span></code></pre>
       <p>Subtle but important: <strong>every</strong> rank must call <code>broadcast</code>. The source rank supplies the data; the others pass an empty buffer of the right shape to receive into. If even one rank skips the call, the whole group deadlocks (more on that below).</p>
 
       <h3>all_reduce — combine-and-share</h3>
       <p>Every rank has a tensor of the <em>same shape but different values</em>. <code>all_reduce</code> combines them element-wise (usually by summing) and gives <em>everyone</em> the combined result.</p>
-      <div class="diagram">
-        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
-          <div class="cell r0">rank0<br>[1,0,0]</div>
-          <div class="cell r1">rank1<br>[0,2,0]</div>
-          <div class="cell r2">rank2<br>[0,0,3]</div>
-          <div class="cell r3">rank3<br>[1,1,1]</div>
-        </div>
-        <div style="text-align:center;color:var(--accent);margin:8px 0;font-size:20px">↓ all_reduce(SUM) ↓</div>
-        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
-          <div class="cell r0">rank0<br>[2,3,4]</div>
-          <div class="cell r0">rank1<br>[2,3,4]</div>
-          <div class="cell r0">rank2<br>[2,3,4]</div>
-          <div class="cell r0">rank3<br>[2,3,4]</div>
-        </div>
-        <div class="cap">Each rank computed a <em>partial</em> result; summing the partials gives the true full result. This is exactly the TP attention output step.</div>
-      </div>
+      <div class="viz" data-viz="collective" data-op="all_reduce"
+        data-sub="Press Run. Each rank computed a partial; summing the partials gives the true result. This is exactly the TP attention output step."></div>
       <pre><code>dist.all_reduce(tensor, op=dist.ReduceOp.SUM)   <span class="tok-com"># in-place: tensor becomes the sum across ranks</span></code></pre>
       <p>Use this when each rank has computed <strong>part of a sum</strong> and the true answer is the total. The shapes match; you're adding numbers in corresponding positions.</p>
 
       <h3>all_gather — collect-the-pieces</h3>
       <p>Every rank has a <em>different chunk</em> of some larger tensor. <code>all_gather</code> concatenates all the chunks and gives everyone the full assembled tensor.</p>
-      <div class="diagram">
-        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
-          <div class="cell r0">rank0<br>[A]</div>
-          <div class="cell r1">rank1<br>[B]</div>
-          <div class="cell r2">rank2<br>[C]</div>
-          <div class="cell r3">rank3<br>[D]</div>
-        </div>
-        <div style="text-align:center;color:var(--accent);margin:8px 0;font-size:20px">↓ all_gather ↓</div>
-        <div class="grid-shard" style="grid-template-columns:repeat(4,90px)">
-          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank0<br>[ABCD]</div>
-          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank1<br>[ABCD]</div>
-          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank2<br>[ABCD]</div>
-          <div class="cell r0" style="background:linear-gradient(90deg,#16344d,#1f3a23,#3a2a16,#331f3a)">rank3<br>[ABCD]</div>
-        </div>
-        <div class="cap">Pieces are <em>concatenated</em>, not summed. This is exactly how SP reassembles the full K/V sequence from per-GPU token chunks.</div>
-      </div>
+      <div class="viz" data-viz="collective" data-op="all_gather"
+        data-sub="Press Run. Pieces are concatenated, not summed. This is exactly how SP reassembles the full K/V sequence from per-GPU token chunks."></div>
       <pre><code>gathered = [torch.empty_like(chunk) <span class="tok-key">for</span> _ <span class="tok-key">in</span> range(world_size)]
 dist.all_gather(gathered, chunk)        <span class="tok-com"># gathered[i] = the chunk that rank i contributed</span>
 full = torch.cat(gathered, dim=...)     <span class="tok-com"># then concatenate along the right axis</span></code></pre>

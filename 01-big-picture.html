@@ -33,6 +33,19 @@
         </tbody>
       </table>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p><strong>Weights</strong> are like a chef's recipes — written down once, the same every single day, no matter who walks into the restaurant. <strong>Activations</strong> are the ingredients chopped up and bubbling on the stove <em>right now</em> for the orders currently in. A bigger cookbook means more recipes (more weights). A busier night with bigger orders means more pots on the stove (more activations). They grow for totally different reasons — and you can run out of stove space even with a tiny cookbook.</p>
+      </div>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Two bills, two drivers — watch what happens as the input gets longer"
+        data-sub="Illustrative GB for one big model as you increase the sequence length (number of tokens)."
+        data-groups='["8K tokens","32K tokens","64K tokens","128K tokens"]'
+        data-series='[{"name":"Model weights","color":"#c099f0","values":[13,13,13,13]},{"name":"Activations","color":"#f0986b","values":[2,8,16,32]}]'
+        data-unit=" GB"
+        data-cap="The purple bar (weights) <strong>never moves</strong> — the model is the same size regardless of input. The orange bar (activations) climbs with every extra token. This single picture is why long context is a memory problem, and why we need more than one parallelism strategy."></div>
+
       <p>Here is why this split matters so much. Suppose you want to serve a model with a <strong>very long context</strong> — the report mentions models targeting 12 million tokens of context. The weights didn't change. But the activations explode, because attention has to deal with that many tokens at once. <strong>You can run out of memory from activations alone, even if the weights fit comfortably.</strong></p>
 
       <div class="callout key">
@@ -63,6 +76,9 @@
         </table>
         <div class="cap">The one-table summary of the entire course. You'll understand every cell by the end of module 7.</div>
       </div>
+
+      <div class="viz" data-viz="shard" data-mode="tp"
+        data-cap=""></div>
 
       <h2>What the test actually measures</h2>
       <p>The experiment (from <code>report.md</code>) runs all three strategies on the same hardware and asks: does TSP really deliver lower peak memory, and is that worth the extra communication?</p>

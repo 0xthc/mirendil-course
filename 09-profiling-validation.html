@@ -14,6 +14,11 @@
       <h1>Profiling &amp; validation</h1>
       <p class="lede">A parallel implementation is worthless if it's either wrong or unmeasured. This module covers the two things the test does around the algorithms: prove correctness, and measure cost.</p>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Two questions, always. <strong>Is it right?</strong> — check the fancy fast version against a slow, obviously-correct version, like proofreading a calculator against long division. <strong>Is it worth it?</strong> — time it with a stopwatch and weigh how much memory it used. You can't tell if your clever trick helped unless you measure both before and after. "It ran without crashing" tells you nothing.</p>
+      </div>
+
       <h2>Part 1 — Proving correctness with a reference oracle</h2>
       <p>How do you know your 8-GPU attention computes the same thing as plain attention? You compare against a <strong>single-GPU reference</strong> — an "oracle" you trust because it's simple. This is the same instinct as testing an optimized function against a naive one.</p>
       <p>The recipe (from <code>report.md</code> and the runners):</p>
@@ -62,6 +67,19 @@ prof.export_chrome_trace(...)           <span class="tok-com"># per-rank trace f
         <span class="label">Per-rank, not global</span>
         <p>Each rank writes its <em>own</em> trace file (e.g. <code>tp_attention_rank_3_trace.json</code>). There's no single global profiler — you collect 8 files and look at the worst one. The repo even stores them in a shared Modal Volume so all ranks' traces land in one place after the run.</p>
       </div>
+
+      <div class="viz" data-viz="flow"
+        data-title="The measurement recipe (what profile_rank_region does)"
+        data-sub="Step through the exact sequence each rank runs to get a clean, comparable number."
+        data-steps='[
+          {"op":"warm up","shape":"run attention once (untimed)","note":"The first call includes one-time CUDA setup. Throw it away so it does not pollute the timing."},
+          {"op":"dist.barrier()","shape":"line up all ranks","note":"Make every GPU start the measured region together — otherwise you measure stragglers, not the work."},
+          {"op":"reset_peak_memory_stats()","shape":"zero the high-water mark","note":"So the peak we read reflects only this region."},
+          {"op":"profile the region","shape":"run attention (timed)","note":"Record CUDA time and memory for just the operation we care about."},
+          {"op":"read results","shape":"max_memory_allocated() · elapsed_ms","note":"Peak memory decides if it FITS; slowest-rank time decides how FAST it is."},
+          {"op":"export trace","shape":"rank_N_trace.json","note":"Each rank writes its own file. Collect all 8 and look at the worst one."}
+        ]'
+        data-cap="Validate on small shapes, then profile big shapes with validation OFF — the dense reference check is more expensive than the thing being measured."></div>
 
       <h2>Where it runs: Modal + torchrun</h2>
       <p>You don't own 8 H100s, so the test rents them on-demand via <strong>Modal</strong> (a serverless GPU platform). The chain, from <code>iterate.py</code>:</p>

@@ -39,6 +39,11 @@ token id 3797  ->  E[3797]  ->  a vector of 4096 numbers</code></pre>
         <p><code>E</code> (the <span class="shape">[50000, 4096]</span> table) is a <strong>weight</strong>: it's the same for every request, learned once during training, and its size depends only on the vocabulary and <code>H</code> — <em>not</em> on your input. <code>X</code> (the <span class="shape">[B, S, 4096]</span> result) is an <strong>activation</strong>: it only exists because you fed in a specific batch, and it grows when you add more tokens or more sequences. This is the whole distinction, in miniature.</p>
       </div>
 
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>An embedding gives every word a set of coordinates in a giant "meaning-space" — like a GPS pin. Words that mean similar things get pins that are close together. The model can't reason about the letters "c-a-t"; it can only do math on the pin's coordinates. The embedding table is just a big phone book: look up the word, get its coordinates.</p>
+      </div>
+
       <h2>Step 2 — The residual stream: the data bus through the model</h2>
       <p>From here on, <strong>that <code>[B, S, H]</code> tensor is the only thing flowing through the network.</strong> Every token is now a point in <code>H</code>-dimensional space (here <code>H = 4096</code>). The model's job is to nudge each token's vector, layer by layer, until it encodes enough context to predict what comes next. This flowing tensor is called the <strong>residual stream</strong>.</p>
       <p>"Residual" because each layer doesn't <em>replace</em> the stream — it computes an <em>update</em> and adds it on:</p>
@@ -93,12 +98,27 @@ out    = hidden @ W_out.T    <span class="tok-com"># [B,S,16384] @ [16384,4096] 
   S = 65536  ->  ~1.07 B elements  (~2.1 GB in bf16)   <span class="tok-com"># just ONE tensor, ONE layer!</span></code></pre>
       <p>Eight times the tokens, eight times the activation memory — and that's a single intermediate tensor. Add up Q, K, V, attention scores, <code>hidden</code>, and the residual stream across all layers and the activation footprint becomes enormous at long context. <strong>That's activation memory — and it's what Sequence Parallelism (module 6) shrinks by splitting the <code>S</code> axis across GPUs.</strong></p>
 
+      <div class="viz" data-viz="memcalc"></div>
+
       <div class="callout warn">
         <span class="label">The punchline that sets up the whole course</span>
         <p>Two memory bills, two completely different drivers. <strong>Weights</strong> are driven by model size (<code>H</code>, <code>I</code>, <code>L</code>, vocab) and are constant per request. <strong>Activations</strong> are driven by workload size (<code>B</code>, <code>S</code>) and vanish when the request ends. You can be crushed by either one independently — and each parallelism strategy in this course targets one or both. Keep this table in your head; module 8 is literally measuring these two quantities on real GPUs.</p>
       </div>
 
       <h2>One token's journey (the whole thing in plain words)</h2>
+
+      <div class="viz" data-viz="flow"
+        data-title="Walk one token through the model"
+        data-sub="Click Next to follow the word &quot;cat&quot; from raw text to a next-token prediction."
+        data-steps='[
+          {"op":"raw token","shape":"3797","note":"The word “cat” is just an integer ID — no math possible yet."},
+          {"op":"embedding lookup  E[3797]","shape":"[H] = [4096]","note":"Look the ID up in the table → a 4096-number vector. It joins the residual stream X."},
+          {"op":"+ attention   (repeated ×32 layers)","shape":"[B, S, H]","note":"The token looks at earlier tokens, gathers context, and ADDS an update to its vector. Shape unchanged."},
+          {"op":"+ MLP   (repeated ×32 layers)","shape":"[B, S, H]","note":"The token is transformed on its own; another update is ADDED. Still the same shape."},
+          {"op":"× E.T  (un-embed)","shape":"[B, S, vocab]","note":"The final vector is scored against every possible next token. Highest score wins — maybe “sat”."}
+        ]'
+        data-cap="Every arrow is a matrix multiply between an <strong>activation</strong> (the stream) and a <strong>weight</strong> (a learned matrix). That's the whole machine."></div>
+
       <ol>
         <li>The word "cat" → token id <code>3797</code> (just an integer).</li>
         <li>Look it up in embedding table <code>E</code> → a 4096-number vector. It joins the residual stream <code>X</code>.</li>
