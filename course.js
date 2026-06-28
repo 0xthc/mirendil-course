@@ -2,19 +2,49 @@
    Mirendil TSP Course — shared navigation + shape calculator
    ============================================================ */
 
-const PAGES = [
-  { file: "index.html",                    num: "",   title: "Course home" },
-  { file: "01-big-picture.html",           num: "01", title: "The big picture" },
-  { file: "02-transformers.html",          num: "02", title: "How a transformer computes" },
-  { file: "03-attention-refresher.html",   num: "03", title: "Attention & the transformer block" },
-  { file: "04-multi-gpu-primitives.html",  num: "04", title: "Multi-GPU primitives" },
-  { file: "05-tensor-parallelism.html",    num: "05", title: "Tensor parallelism (TP)" },
-  { file: "06-sequence-parallelism.html",  num: "06", title: "Sequence parallelism (SP)" },
-  { file: "07-tensor-sequence-parallelism.html", num: "07", title: "Tensor-sequence parallelism (TSP)" },
-  { file: "08-tradeoffs.html",             num: "08", title: "Tradeoffs & when to use what" },
-  { file: "09-profiling-validation.html",  num: "09", title: "Profiling & validation" },
-  { file: "10-glossary.html",              num: "10", title: "Glossary & cheat sheet" },
+const SECTIONS = [
+  {
+    title: "",
+    pages: [{ file: "index.html", num: "", title: "Course home" }],
+  },
+  {
+    title: "Track 1 · Parallelism & training",
+    pages: [
+      { file: "01-big-picture.html",           num: "01", title: "The big picture" },
+      { file: "02-transformers.html",          num: "02", title: "How a transformer computes" },
+      { file: "03-attention-refresher.html",   num: "03", title: "Attention & the transformer block" },
+      { file: "04-multi-gpu-primitives.html",  num: "04", title: "Multi-GPU primitives" },
+      { file: "05-tensor-parallelism.html",    num: "05", title: "Tensor parallelism (TP)" },
+      { file: "06-sequence-parallelism.html",  num: "06", title: "Sequence parallelism (SP)" },
+      { file: "07-tensor-sequence-parallelism.html", num: "07", title: "Tensor-sequence parallelism (TSP)" },
+      { file: "08-tradeoffs.html",             num: "08", title: "Tradeoffs & when to use what" },
+      { file: "09-profiling-validation.html",  num: "09", title: "Profiling & validation" },
+      { file: "10-glossary.html",              num: "10", title: "Glossary & cheat sheet" },
+    ],
+  },
+  {
+    title: "Track 2 · Building with models",
+    pages: [
+      { file: "p1-inference.html",        num: "P1", title: "Inference, latency & cost" },
+      { file: "p2-talking-to-models.html", num: "P2", title: "Talking to models in production" },
+      { file: "p3-agents.html",           num: "P3", title: "Agents" },
+      { file: "p4-rag.html",              num: "P4", title: "RAG & context management" },
+      { file: "p5-evals.html",            num: "P5", title: "Evals & telemetry" },
+      { file: "p6-safety.html",           num: "P6", title: "Safety in product" },
+      { file: "p7-system-design.html",    num: "P7", title: "Product system design" },
+    ],
+  },
+  {
+    title: "Interview prep",
+    pages: [
+      { file: "iv-questions.html",      num: "IV", title: "Question bank" },
+      { file: "iv-system-design.html",  num: "IV", title: "System-design walkthroughs" },
+      { file: "iv-coding.html",         num: "IV", title: "Coding exercises" },
+    ],
+  },
 ];
+
+const PAGES = SECTIONS.flatMap((s) => s.pages);
 
 function currentFile() {
   const path = window.location.pathname.split("/").pop();
@@ -23,21 +53,25 @@ function currentFile() {
 
 function buildSidebar() {
   const here = currentFile();
-  const links = PAGES.map((p) => {
-    const active = p.file === here ? " class=\"active\"" : "";
-    const num = p.num ? `<span class="num">${p.num}</span>` : `<span class="num">★</span>`;
-    return `<li><a href="${p.file}"${active}>${num}<span>${p.title}</span></a></li>`;
+  const sectionsHtml = SECTIONS.map((sec) => {
+    const links = sec.pages.map((p) => {
+      const active = p.file === here ? " class=\"active\"" : "";
+      const num = p.num ? `<span class="num">${p.num}</span>` : `<span class="num">★</span>`;
+      return `<li><a href="${p.file}"${active}>${num}<span>${p.title}</span></a></li>`;
+    }).join("");
+    const header = sec.title ? `<li class="nav-section">${sec.title}</li>` : "";
+    return header + links;
   }).join("");
 
   return `
     <aside class="sidebar">
       <div class="brand">
         <a href="index.html">
-          <span class="title">TSP for Engineers</span>
-          <span class="subtitle">Mirendil AI Lab — concept course</span>
+          <span class="title">AI Eng for Engineers</span>
+          <span class="subtitle">Parallelism · building with models · interview prep</span>
         </a>
       </div>
-      <nav><ul class="nav-list">${links}</ul></nav>
+      <nav><ul class="nav-list">${sectionsHtml}</ul></nav>
     </aside>`;
 }
 

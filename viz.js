@@ -261,7 +261,78 @@
     render();
   }
 
-  const REGISTRY = { barchart, collective, memcalc, attention, shard, flow };
+  /* ---------------- 7. Latency & cost calculator ---------------- */
+  function costcalc(el) {
+    // Illustrative per-1M-token prices (USD) and per-token decode latency (ms).
+    // Editable defaults; clearly labeled as illustrative, not a price sheet.
+    const MODELS = {
+      "Small / fast": { inUsd: 0.80, outUsd: 4.0, msPerOut: 4 },
+      "Mid": { inUsd: 3.0, outUsd: 15.0, msPerOut: 7 },
+      "Large / best": { inUsd: 15.0, outUsd: 75.0, msPerOut: 12 },
+    };
+    el.innerHTML =
+      `<div class="viz-title">${esc(el.getAttribute("data-title") || "Latency & cost calculator")}</div>` +
+      `<div class="viz-sub">${esc(el.getAttribute("data-sub") || "Illustrative numbers — the point is the SHAPE of the tradeoffs, not exact prices. Output tokens dominate both cost and latency.")}</div>` +
+      `<div class="controls">
+        <div class="seg" data-models>${Object.keys(MODELS).map((k, i) => `<button data-model="${k}" class="${i === 1 ? "on" : ""}">${k}</button>`).join("")}</div>
+      </div>` +
+      sliderRow("in", "Input (prompt) tokens", 100, 200000, 4000, 100) +
+      sliderRow("out", "Output tokens", 50, 8000, 600, 50) +
+      sliderRow("rps", "Requests / day (thousands)", 1, 1000, 50, 1) +
+      `<div class="controls"><label style="display:flex;gap:8px;align-items:center;font-size:14px;color:var(--text-dim);cursor:pointer"><input type="checkbox" data-cache style="accent-color:var(--accent)"> Prompt caching on (90% of input cached, 0.1× price)</label></div>` +
+      `<div data-bars style="margin-top:14px"></div>` +
+      `<div class="viz-cap" data-read></div>`;
+
+    let model = "Mid";
+
+    function sliderRow(id, label, min, max, val, step) {
+      return `<div class="slider-row"><label>${label}</label><input type="range" data-s="${id}" min="${min}" max="${max}" step="${step}" value="${val}"><span class="val" data-v="${id}">${val}</span></div>`;
+    }
+    function bar(label, valueText, frac, color) {
+      return `<div style="margin:8px 0"><div style="display:flex;justify-content:space-between;font-size:13px;margin-bottom:3px"><span style="color:${color};font-weight:600">${label}</span><span style="font-family:var(--mono);color:var(--text)">${valueText}</span></div>`
+        + `<div style="background:var(--bg);border-radius:6px;height:20px;overflow:hidden"><div style="height:100%;width:${Math.max(1, Math.min(100, frac * 100)).toFixed(1)}%;background:${color};border-radius:6px;transition:width .3s"></div></div></div>`;
+    }
+    function update() {
+      const m = MODELS[model];
+      const inTok = +el.querySelector('[data-s=in]').value;
+      const outTok = +el.querySelector('[data-s=out]').value;
+      const rpsK = +el.querySelector('[data-s=rps]').value;
+      const cache = el.querySelector('[data-cache]').checked;
+      el.querySelector('[data-v=in]').textContent = inTok.toLocaleString();
+      el.querySelector('[data-v=out]').textContent = outTok.toLocaleString();
+      el.querySelector('[data-v=rps]').textContent = rpsK + "K";
+
+      const cachedFrac = cache ? 0.9 : 0;
+      const inEffective = inTok * (1 - cachedFrac) + inTok * cachedFrac * 0.1;
+      const inCost = (inEffective / 1e6) * m.inUsd;
+      const outCost = (outTok / 1e6) * m.outUsd;
+      const perReq = inCost + outCost;
+      const perDay = perReq * rpsK * 1000;
+      const totalCost = inCost + outCost;
+      const latency = outTok * m.msPerOut; // decode dominates; prefill ~ smaller, omitted for clarity
+
+      const bars = el.querySelector("[data-bars]");
+      const maxc = Math.max(inCost, outCost, 1e-9);
+      bars.innerHTML =
+        bar("Input token cost / request", "$" + inCost.toFixed(5), inCost / maxc, "#c099f0") +
+        bar("Output token cost / request", "$" + outCost.toFixed(5), outCost / maxc, "#f0986b") +
+        bar("Est. generation latency", (latency / 1000).toFixed(2) + " s", latency / (8000 * 12), "#57b6f5");
+      el.querySelector("[data-read]").innerHTML =
+        `<strong style="color:var(--accent)">$${perReq.toFixed(5)}</strong> per request · ` +
+        `<strong style="color:var(--accent)">$${perDay.toLocaleString(undefined, { maximumFractionDigits: 0 })}</strong> per day at ${rpsK}K req · ` +
+        `~<strong>${(latency / 1000).toFixed(1)}s</strong> to generate. ` +
+        `Notice: output tokens are priced ~5× input and drive latency — <em>shortening outputs</em> and <em>prompt caching</em> are your biggest levers.`;
+    }
+    el.querySelectorAll("[data-model]").forEach((b) => b.addEventListener("click", () => {
+      model = b.getAttribute("data-model");
+      el.querySelectorAll("[data-model]").forEach((x) => x.classList.toggle("on", x === b));
+      update();
+    }));
+    el.querySelectorAll("input").forEach((i) => i.addEventListener("input", update));
+    update();
+  }
+
+  const REGISTRY = { barchart, collective, memcalc, attention, shard, flow, costcalc };
 
   function init() {
     document.querySelectorAll(".viz[data-viz]").forEach((el) => {

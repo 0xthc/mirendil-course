@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P2 · Talking to models in production</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P2</div>
+      <h1>Talking to models in production</h1>
+      <p class="lede">A model in a product is just an HTTP endpoint you POST a list of messages to. That sounds simple, and the happy path is. The job — the part that separates a demo from a product — is everything around it: shaping the conversation, getting <em>structured</em> data back reliably, letting the model call your code, streaming tokens so the UI feels alive, and handling the dozen ways a network call can go sideways. This page is the day-to-day API mechanics a product engineer touches constantly.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Talking to a model is like texting a very capable contractor who has no memory between texts. Every time you message them, you must re-send the whole thread so they remember what you are doing. You also hand them a job description up front (the <strong>system prompt</strong>), you can give them tools and say <em>here is how to phone the warehouse if you need a part</em> (tool calling), and you can ask them to reply on a strict form instead of free prose (structured output). The contractor is brilliant but literal — so the shape of how you ask matters as much as what you ask.</p>
+      </div>
+
+      <h2>The shape of a request: a list of messages</h2>
+      <p>Almost every chat-style model takes the same core input: an ordered list of <strong>messages</strong>, each tagged with a <strong>role</strong>. You send the whole list every turn — the model is stateless, so the conversation lives in your array, not on the server.</p>
+      <pre><code>messages = [
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"system"</span>,    <span class="tok-str">"content"</span>: <span class="tok-str">"You are a terse support agent for Acme..."</span>},
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>,      <span class="tok-str">"content"</span>: <span class="tok-str">"My order never arrived."</span>},
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"I can help. What is your order number?"</span>},
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>,      <span class="tok-str">"content"</span>: <span class="tok-str">"A-10473"</span>}
+]</code></pre>
+
+      <h3>The three roles, and what belongs where</h3>
+      <table>
+        <thead><tr><th>Role</th><th>Who it represents</th><th>What goes in it</th></tr></thead>
+        <tbody>
+          <tr><td><code>system</code></td><td>You, the product</td><td>Durable instructions: persona, rules, format, tone, what the model may/may not do, available context. Set once, applies to the whole conversation.</td></tr>
+          <tr><td><code>user</code></td><td>The end user (or your app on their behalf)</td><td>The actual request or turn. Also where you inject retrieved documents, the user's selection, form data.</td></tr>
+          <tr><td><code>assistant</code></td><td>The model</td><td>The model's prior replies. You echo them back so the model sees its own history. You can also <em>prefill</em> a partial assistant turn to steer the start of its answer.</td></tr>
+        </tbody>
+      </table>
+
+      <p>On the Claude API the system prompt is a top-level <code>system</code> field rather than a message in the array, but the mental model is identical: stable instructions live separate from the turn-by-turn dialogue.</p>
+
+      <div class="callout key">
+        <span class="label">The system prompt is your product spec, not a greeting</span>
+        <p>Put everything <em>durable and trusted</em> in the system prompt: role, hard rules, output format, refusal policy, tool-usage guidance. Put everything <em>per-turn and user-controlled</em> in user messages. This split matters for safety too — the model is trained to weight system instructions above user instructions, so a rule like <em>never reveal account balances</em> belongs in system, where a user message saying <em>ignore your rules</em> has less leverage against it.</p>
+      </div>
+
+      <h3>Few-shot examples: teach by showing</h3>
+      <p>When a rule is hard to state but easy to demonstrate, give the model worked examples as fake prior turns. A handful of <code>user</code> → <code>assistant</code> pairs showing the exact input/output behavior you want often beats paragraphs of instructions. This is <strong>few-shot prompting</strong>, and it is the cheapest reliability lever you have before reaching for fine-tuning.</p>
+      <pre><code>messages = [
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"system"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"Classify each message as BILLING, BUG, or OTHER. Reply with one word."</span>},
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"I was charged twice"</span>},        <span class="tok-com"># example 1</span>
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"BILLING"</span>},
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"the app crashes on launch"</span>},  <span class="tok-com"># example 2</span>
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"BUG"</span>},
+  {<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"do you ship to Canada?"</span>}      <span class="tok-com"># the real one</span>
+]</code></pre>
+
+      <div class="callout eli5">
+        <span class="label">ELI5 — few-shot</span>
+        <p>Instead of explaining the rules of a card game, you play two hands face-up while the new player watches, then deal them in. They pattern-match off what they just saw. Models do the same: two or three clean examples pin down the format and edge cases far better than a wall of prose.</p>
+      </div>
+
+      <h2>Structured outputs: getting reliable JSON</h2>
+      <p>Most product features do not want prose — they want <em>data</em>: a category, a list of extracted fields, a function argument. The naive move is to add <em>respond in JSON</em> to the prompt. That works in the demo and fails in production, because plain text generation has no guarantee of being valid JSON.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Why “just ask for JSON” is fragile</span>
+        <p>A free-text model will, often enough to hurt, wrap the JSON in a markdown code fence, add a chatty preamble like <em>Sure, here is the JSON:</em>, emit a trailing comma, use single quotes, hallucinate an extra field, or get truncated mid-object when it hits the token limit. At 99% success that is one broken response in a hundred — a constant stream of 3am pages at any real volume. You need a mechanism that constrains the <em>structure</em>, not a polite request that hopes for one.</p>
+      </div>
+
+      <h3>Two reliable mechanisms</h3>
+      <p>Modern APIs give you two ways to enforce structure, and they share the same engine under the hood (constrained decoding against a schema):</p>
+      <ul>
+        <li><strong>Response schema / JSON mode</strong> — you attach a JSON Schema to the request; the API constrains generation so the output validates against it. Best when you want <em>one</em> structured object as the answer.</li>
+        <li><strong>Tool / function calling</strong> — you define a tool whose input schema <em>is</em> your desired shape, and force the model to call it. The tool-call arguments come back as schema-valid JSON. This is the most portable trick: even APIs without a dedicated JSON mode support tools, so “define a tool you never actually run, just to extract fields” is a common pattern.</li>
+      </ul>
+
+      <p>Here is a concrete JSON Schema for an extraction task — pulling a support ticket into fields:</p>
+      <pre><code>{
+  <span class="tok-str">"type"</span>: <span class="tok-str">"object"</span>,
+  <span class="tok-str">"properties"</span>: {
+    <span class="tok-str">"category"</span>: { <span class="tok-str">"type"</span>: <span class="tok-str">"string"</span>, <span class="tok-str">"enum"</span>: [<span class="tok-str">"billing"</span>, <span class="tok-str">"bug"</span>, <span class="tok-str">"other"</span>] },
+    <span class="tok-str">"urgency"</span>:  { <span class="tok-str">"type"</span>: <span class="tok-str">"integer"</span>, <span class="tok-str">"minimum"</span>: <span class="tok-num">1</span>, <span class="tok-str">"maximum"</span>: <span class="tok-num">5</span> },
+    <span class="tok-str">"summary"</span>:  { <span class="tok-str">"type"</span>: <span class="tok-str">"string"</span>, <span class="tok-str">"maxLength"</span>: <span class="tok-num">280</span> },
+    <span class="tok-str">"needs_human"</span>: { <span class="tok-str">"type"</span>: <span class="tok-str">"boolean"</span> }
+  },
+  <span class="tok-str">"required"</span>: [<span class="tok-str">"category"</span>, <span class="tok-str">"urgency"</span>, <span class="tok-str">"summary"</span>, <span class="tok-str">"needs_human"</span>],
+  <span class="tok-str">"additionalProperties"</span>: <span class="tok-key">false</span>
+}</code></pre>
+
+      <p>And the same shape expressed as a Claude tool definition — note the <code>input_schema</code> <em>is</em> the JSON Schema above:</p>
+      <pre><code>tools = [{
+  <span class="tok-str">"name"</span>: <span class="tok-str">"record_ticket"</span>,
+  <span class="tok-str">"description"</span>: <span class="tok-str">"Save the structured support ticket. Always call this exactly once."</span>,
+  <span class="tok-str">"input_schema"</span>: {
+    <span class="tok-str">"type"</span>: <span class="tok-str">"object"</span>,
+    <span class="tok-str">"properties"</span>: {
+      <span class="tok-str">"category"</span>: { <span class="tok-str">"type"</span>: <span class="tok-str">"string"</span>, <span class="tok-str">"enum"</span>: [<span class="tok-str">"billing"</span>, <span class="tok-str">"bug"</span>, <span class="tok-str">"other"</span>] },
+      <span class="tok-str">"urgency"</span>:  { <span class="tok-str">"type"</span>: <span class="tok-str">"integer"</span>, <span class="tok-str">"minimum"</span>: <span class="tok-num">1</span>, <span class="tok-str">"maximum"</span>: <span class="tok-num">5</span> },
+      <span class="tok-str">"summary"</span>:  { <span class="tok-str">"type"</span>: <span class="tok-str">"string"</span> }
+    },
+    <span class="tok-str">"required"</span>: [<span class="tok-str">"category"</span>, <span class="tok-str">"urgency"</span>, <span class="tok-str">"summary"</span>]
+  }
+}]
+
+<span class="tok-com"># Force the model to use it, so you always get structured args back:</span>
+resp = client.messages.create(
+    model=<span class="tok-str">"claude-sonnet-4-6"</span>,
+    tools=tools,
+    tool_choice={<span class="tok-str">"type"</span>: <span class="tok-str">"tool"</span>, <span class="tok-str">"name"</span>: <span class="tok-str">"record_ticket"</span>},
+    messages=messages,
+)</code></pre>
+
+      <h3>Validate, then retry — even with schema enforcement</h3>
+      <p>Constrained decoding makes malformed JSON rare, not impossible (truncation at <code>max_tokens</code> can still cut an object in half). So always parse and validate against your schema in code, and on failure, retry with the error fed back in:</p>
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">extract</span>(messages, attempts=<span class="tok-num">3</span>):
+    <span class="tok-key">for</span> i <span class="tok-key">in</span> range(attempts):
+        resp = call_model(messages)
+        <span class="tok-key">try</span>:
+            data = json.loads(resp.text)
+            schema.validate(data)          <span class="tok-com"># jsonschema / pydantic / zod</span>
+            <span class="tok-key">return</span> data                    <span class="tok-com"># success</span>
+        <span class="tok-key">except</span> (ValueError, SchemaError) <span class="tok-key">as</span> e:
+            messages += [
+              {<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: resp.text},
+              {<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>,
+               <span class="tok-str">"content"</span>: <span class="tok-str">f"That did not validate: {e}. Return ONLY valid JSON for the schema."</span>}
+            ]
+    <span class="tok-key">raise</span> ExtractionFailed(messages)    <span class="tok-com"># give up loudly, do not silently swallow</span></code></pre>
+
+      <div class="callout key">
+        <span class="label">The reliability stack, in order</span>
+        <p>(1) Constrain structure with a schema or forced tool call — do not rely on prose instructions. (2) Parse and validate in your own code; the API contract is bytes, not meaning. (3) Retry with the validation error fed back, capped at a small number of attempts. (4) Fail loudly when retries exhaust — never return a half-parsed object downstream. Each layer catches what the one above misses.</p>
+      </div>
+
+      <h2>Tool / function calling: the round trip</h2>
+      <p>Tool calling is how a model reaches outside its own text box — to look up an order, query a database, hit a weather API, run a calculation. The crucial thing to understand is that <strong>the model never runs your code.</strong> It only <em>emits a request</em> to run a tool; your application runs it and feeds the result back. The loop is:</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="One tool-calling round trip"
+        data-sub="The model can ask to run a tool, but your code does the running. Click Next to follow one full loop."
+        data-steps='[
+          {"op":"1 · user message","shape":"What is the status of order A-10473?","note":"You send the conversation plus your list of tool definitions (name, description, input_schema) to the model."},
+          {"op":"2 · model returns a tool_call","shape":"get_order_status(id = A-10473)","note":"Instead of prose, the model stops and emits a structured tool-use block: which tool, and schema-valid arguments. The API marks stop_reason = tool_use. It has NOT run anything."},
+          {"op":"3 · your code runs the tool","shape":"db.orders.find(A-10473) → shipped","note":"Your application executes the real function — a DB query, an HTTP call — with the model-supplied args. This is where auth, validation, and rate limits live. The model never touches your systems directly."},
+          {"op":"4 · feed the result back","shape":"tool_result: {status: shipped, eta: Tue}","note":"Append the model assistant turn (the tool_call) AND a tool_result message carrying the return value, then call the API again with the whole updated thread."},
+          {"op":"5 · model continues","shape":"Your order shipped and arrives Tuesday.","note":"Now holding the real data, the model writes the final natural-language answer — or emits ANOTHER tool_call, and the loop repeats until it stops."}
+        ]'
+        data-cap="The model is the planner; <strong>your code is the hands</strong>. Steps 2–4 can repeat many times in one user turn — that loop is the heart of an agent."></div>
+
+      <p>Concretely, after the model returns a tool call, your next request appends two messages — the assistant's tool-use turn and your tool-result turn:</p>
+      <pre><code><span class="tok-com"># ... earlier messages ...</span>
+{<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: [
+   {<span class="tok-str">"type"</span>: <span class="tok-str">"tool_use"</span>, <span class="tok-str">"id"</span>: <span class="tok-str">"tu_01"</span>,
+    <span class="tok-str">"name"</span>: <span class="tok-str">"get_order_status"</span>, <span class="tok-str">"input"</span>: {<span class="tok-str">"id"</span>: <span class="tok-str">"A-10473"</span>}}
+]},
+{<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: [
+   {<span class="tok-str">"type"</span>: <span class="tok-str">"tool_result"</span>, <span class="tok-str">"tool_use_id"</span>: <span class="tok-str">"tu_01"</span>,
+    <span class="tok-str">"content"</span>: <span class="tok-str">"{\\"status\\": \\"shipped\\", \\"eta\\": \\"Tue\\"}"</span>}
+]}
+<span class="tok-com"># then call the API again with this extended thread</span></code></pre>
+
+      <div class="callout gotcha">
+        <span class="label">The result must be tied back by id</span>
+        <p>Each <code>tool_result</code> carries the <code>tool_use_id</code> of the call it answers. If the model fires several tool calls in one turn (parallel tool use), you must return a result block for <em>every</em> id before the model will continue — miss one and the next request errors. Also: never trust tool <em>arguments</em> blindly. The model can hallucinate an id or pass an out-of-range value, so validate and authorize inside your tool exactly as you would for untrusted user input.</p>
+      </div>
+
+      <h2>Streaming and cancellation</h2>
+      <p>A model generates one token at a time. If you wait for the whole response, the user stares at a spinner for several seconds. If you <strong>stream</strong>, you forward each token as it is produced and the answer appears to type itself — the total time is identical, but <em>perceived</em> latency collapses because time-to-first-token is a few hundred milliseconds instead of the full generation.</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Perceived latency: streaming vs. waiting"
+        data-sub="Same model, same 600-token answer (~3s end to end). What changes is when the user first sees something."
+        data-groups='["Time to first token","Time to full answer"]'
+        data-series='[
+          {"name":"No streaming","color":"#f0986b","values":[3000,3000]},
+          {"name":"Streaming","color":"#5fd38a","values":[300,3000]}
+        ]'
+        data-unit=" ms"
+        data-cap="Streaming does not make generation faster — the full answer lands at the same time. It makes the wait <strong>feel</strong> ~10× shorter by showing the first words almost immediately."></div>
+
+      <p>Mechanically, instead of one JSON response you open a stream (server-sent events) and receive a series of small events — a start, many incremental token deltas, then a stop. You append deltas to the UI as they arrive:</p>
+      <pre><code><span class="tok-key">const</span> stream = <span class="tok-key">await</span> client.messages.stream({
+  model: <span class="tok-str">"claude-haiku-4-5"</span>,
+  messages,
+});
+<span class="tok-key">for</span> <span class="tok-key">await</span> (<span class="tok-key">const</span> event <span class="tok-key">of</span> stream) {
+  <span class="tok-key">if</span> (event.type === <span class="tok-str">"content_block_delta"</span>)
+    ui.append(event.delta.text);   <span class="tok-com"># paint each token as it lands</span>
+}</code></pre>
+
+      <h3>Cancellation: stop paying for tokens nobody wants</h3>
+      <p>Because the model bills per output token, a generation the user has abandoned — they closed the tab, hit stop, or edited their question — is pure waste. The fix is an <strong>abort signal</strong>: a handle you can trip to tear down the in-flight request. The server stops generating, and you stop being billed for the remaining tokens.</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="The stream lifecycle, with a cancel"
+        data-sub="A streamed request you can abort mid-flight. Click Next to walk the states."
+        data-steps='[
+          {"op":"open","shape":"POST /messages  (stream = true)","note":"You open the stream and pass an abort signal. The connection stays open; the model begins generating."},
+          {"op":"tokens","shape":"delta → delta → delta …","note":"Token deltas arrive over server-sent events. You paint each one into the UI. Time-to-first-token is what the user feels."},
+          {"op":"cancel?","shape":"controller.abort()","note":"User hits Stop or navigates away. You trip the abort signal — the HTTP request is torn down and the server halts generation."},
+          {"op":"billing stops","shape":"charged for tokens emitted so far only","note":"You stop paying for the tokens that would have followed. On a long abandoned answer, that is most of the cost saved."},
+          {"op":"close","shape":"message_stop  /  aborted","note":"The stream closes — either naturally with a final stop event, or early via the abort. Clean up the UI state either way."}
+        ]'
+        data-cap="No cancellation means a user who clicks away still runs up the full token bill. Wiring the abort signal through to the SDK call is a real cost lever, not a nicety."></div>
+
+      <pre><code><span class="tok-key">const</span> controller = <span class="tok-key">new</span> AbortController();
+<span class="tok-com"># Pass the signal into the SDK / fetch call:</span>
+<span class="tok-key">const</span> stream = client.messages.stream(
+  { model: <span class="tok-str">"claude-sonnet-4-6"</span>, messages },
+  { signal: controller.signal }
+);
+<span class="tok-com"># Later, when the user clicks Stop or the request times out:</span>
+stopButton.onclick = () =&gt; controller.abort();</code></pre>
+
+      <div class="callout key">
+        <span class="label">Streaming is UX; cancellation is cost</span>
+        <p>Two separate wins from the same plumbing. Streaming buys you <em>perceived latency</em> — the answer feels instant even though it is not. Cancellation buys you <em>money and capacity back</em> — abandoned generations stop consuming output tokens and rate-limit budget. Ship streaming for the feel; wire the abort signal so the feel does not cost you on every dropped request.</p>
+      </div>
+
+      <h2>The unglamorous reliability details</h2>
+
+      <h3>Determinism and temperature</h3>
+      <p><strong>Temperature</strong> controls randomness in sampling. At <code>temperature = 0</code> the model picks the highest-probability token at each step, which is as deterministic as it gets — best for extraction, classification, and anything you will parse. Higher values (toward <code>1.0</code>) add variety, useful for brainstorming or copy. Note even at <code>0</code> you are <em>not</em> guaranteed byte-identical output across calls — floating-point and infrastructure nondeterminism can still cause rare divergence — so do not build a system that assumes the same prompt always yields the same bytes.</p>
+
+      <h3>Idempotency and retries on network errors</h3>
+      <p>A timeout or <code>5xx</code> does not tell you whether the request was processed — the response may have been generated and lost on the way back. Blind retries can double-bill or double-act (imagine a tool that charges a card). Use an <strong>idempotency key</strong> so a retried request is recognized as the same one, and retry with <strong>exponential backoff plus jitter</strong> on <code>429</code> (rate limit) and <code>5xx</code>, but <em>not</em> on <code>4xx</code> like a malformed request, which will fail identically every time.</p>
+
+      <h3>Truncation: hitting max_tokens</h3>
+      <p>Every response has a <code>max_tokens</code> cap. If the model hits it mid-sentence, you get a partial answer and a <code>stop_reason</code> of <code>max_tokens</code> (not <code>end_turn</code>). Always check the stop reason: if it is <code>max_tokens</code>, the output is truncated — your JSON may be half an object. Handle it by raising the cap, asking the model to continue, or treating it as a validation failure and retrying.</p>
+
+      <h3>Refusals</h3>
+      <p>The model may decline a request on safety grounds, returning a polite refusal as normal assistant text (and on some APIs a distinct <code>stop_reason</code> such as <code>refusal</code>). Your parser must not mistake a refusal for a malformed structured output and retry forever — detect it, and route to a human or a fallback rather than hammering the API.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Always read stop_reason before you trust the body</span>
+        <p>The single most common production bug here: code that grabs <code>response.content</code> and parses it without checking <em>why</em> the model stopped. <code>end_turn</code> means a complete answer; <code>tool_use</code> means it wants you to run a tool; <code>max_tokens</code> means it is truncated; <code>refusal</code> means it declined. Branch on the stop reason first — half of robust model plumbing is just respecting that field.</p>
+      </div>
+
+      <h2>How this shows up in the interview</h2>
+
+      <h3>“Design tool calling for an agent that can look up and refund orders.”</h3>
+      <p>Walk the round trip explicitly: define tools with clear names, descriptions, and <code>input_schema</code>; send them with the conversation; the model returns a <code>tool_use</code> block with arguments; <em>your</em> code executes the real function; you append the <code>tool_use</code> assistant turn plus a <code>tool_result</code> keyed by <code>tool_use_id</code>; call again; loop until <code>stop_reason</code> is <code>end_turn</code>. Then show seniority: the model only <em>proposes</em>, so authorization and validation live in your tool, not the prompt — a refund tool checks the caller actually owns the order and enforces limits server-side. Add an idempotency key so a retried refund does not double-charge, and cap the loop length to prevent runaway tool cycles.</p>
+
+      <h3>“How do you make structured output reliable?”</h3>
+      <p>Lead with why prose instructions fail: free-text generation has no structural guarantee, so you get fences, preambles, trailing commas, and truncation. Then give the stack — constrain with a JSON Schema / forced tool call (constrained decoding), parse and validate in your own code, retry feeding the validation error back, and fail loudly after a small cap. Mention that even constrained output can be truncated at <code>max_tokens</code>, so you still check <code>stop_reason</code>. The signal they want: you treat the API contract as <em>bytes you must validate</em>, not meaning you can assume.</p>
+
+      <h3>“Implement streaming with cancellation.”</h3>
+      <p>Separate the two wins: streaming is for perceived latency (forward token deltas over SSE; time-to-first-token drops to a few hundred ms while total time is unchanged), cancellation is for cost (an <code>AbortController</code> whose signal is threaded into the SDK call, tripped on user-stop, tab-close, or timeout — the server halts generation and billing stops). Mention the failure mode of <em>not</em> doing it: abandoned generations keep consuming output tokens and rate-limit budget. Bonus points for handling partial state cleanup and for noting that a cancel still bills for tokens already emitted.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>A teammate adds “respond only in JSON” to the system prompt and ships it. It works in testing. Why will it page someone, and what do you change?</summary>
+        <div class="answer">
+          <p>Plain-text generation has no structural guarantee, so at volume you will get markdown fences, chatty preambles, trailing commas, or output truncated at <code>max_tokens</code> — each a parse failure. Replace the polite request with an <em>enforced</em> mechanism: a response JSON Schema or a forced tool call (constrained decoding), then validate the result in code and retry with the error fed back, capping attempts and failing loudly. The prompt asks; the schema enforces.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>The model returns a tool_use block. Did it run your function? What exactly do you send on the next request?</summary>
+        <div class="answer">
+          <p>No — the model never executes anything; it only emits a request to run the tool, with arguments. <em>Your</em> code runs the real function (validating and authorizing the arguments first). On the next request you append two things to the thread: the assistant turn containing the <code>tool_use</code> block, and a <code>tool_result</code> message carrying the return value and the matching <code>tool_use_id</code>. Then you call the API again; the model uses the result to continue or to call another tool.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>A user closes the tab two seconds into a long streamed answer. With and without an abort signal, what happens to your bill?</summary>
+        <div class="answer">
+          <p>Without cancellation, the server keeps generating to completion and you are billed for every output token, even though nobody will see them — plus it consumes your rate-limit budget. With an <code>AbortController</code> whose signal is passed into the SDK call, tripping <code>controller.abort()</code> tears down the request, the server halts generation, and you only pay for the tokens emitted before the abort. On long abandoned answers that is most of the cost saved.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Your extraction call returns content that fails JSON parsing. Before retrying, which one field should you check, and why?</summary>
+        <div class="answer">
+          <p>Check <code>stop_reason</code>. If it is <code>max_tokens</code>, the output is truncated — the JSON is incomplete because generation was cut off, so the fix is to raise the cap or ask it to continue, not to re-prompt for valid JSON. If it is <code>refusal</code>, the model declined, and retrying forever just burns money — route to a human or fallback. Only if it stopped normally (<code>end_turn</code>) does a “that did not validate, try again” retry make sense.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

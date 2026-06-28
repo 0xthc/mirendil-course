@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interview · Question bank</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Interview prep</div>
+      <h1>Interview question bank</h1>
+      <p class="lede">A categorized bank of the questions you are actually likely to get when interviewing for <strong>Member of Technical Staff, Product Engineering</strong> at an AI lab — each one with what the interviewer is probing for, and the answer a strong candidate gives. Use the toggles to quiz yourself: read the question, answer out loud, then expand.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>This page is a deck of flashcards. The <em>summary</em> is the question; the hidden <em>answer</em> tells you two things — what the interviewer is really fishing for, and roughly what a great answer sounds like. Cover the answer, take a real swing, then check yourself. Spaced repetition beats re-reading.</p>
+      </div>
+
+      <h2>How product-eng interviews at AI labs are structured</h2>
+      <p>Product Engineering at a lab is not pure research and not pure web-app CRUD. You are the layer that turns a raw model into something people can use reliably: APIs, SDKs, agent harnesses, eval pipelines, internal tooling. Interviews reflect that blend. A typical loop:</p>
+      <ul>
+        <li><strong>Practical coding (1–2 rounds).</strong> Build something real and LLM-flavored in 45–60 min: a streaming endpoint, a tool-calling loop, a parser for structured output. They watch how you handle partial data, failures, and retries — not whether you memorized an algorithm.</li>
+        <li><strong>System / API design (1 round).</strong> Design an LLM-serving API, a RAG system, or an agent platform. They want streaming, metering, caching, rate limiting, and failure modes — the operational reality of running models at scale.</li>
+        <li><strong>LLM judgment (often folded into design).</strong> Open-ended calls: when do you fine-tune vs prompt? How do you make output reliable when the model is nondeterministic? How do you defend against prompt injection?</li>
+        <li><strong>Product sense (1 round).</strong> Given a fuzzy goal and two weeks, what do you ship and what do you cut? Which metric proves it worked?</li>
+        <li><strong>Behavioral / ownership (1 round).</strong> High-agency stories: 0→1 ships, hard tradeoffs, a failure you owned. Labs index hard on agency and judgment under ambiguity.</li>
+      </ul>
+
+      <div class="callout key">
+        <span class="label">The through-line</span>
+        <p>Across every round they are answering one question: <strong>can you take an unreliable, nondeterministic, expensive component and build a product around it that users trust?</strong> Reliability, cost/latency awareness, and good taste under ambiguity are the traits being scored — not trivia.</p>
+      </div>
+
+      <h2>Where to spend your prep time</h2>
+      <div class="viz" data-viz="barchart"
+        data-title="Suggested prep allocation by category"
+        data-sub="Rough guide for a full-stack engineer new to LLM-specific interviewing. Coding and design dominate; fundamentals are cheap insurance."
+        data-groups='["Practical coding","System design","LLM judgment","Product sense","Fundamentals","Behavioral"]'
+        data-series='[{"name":"Relative hours","color":"#57b6f5","values":[25,22,18,13,12,10]}]'
+        data-unit="%"
+        data-cap="If you are already strong at general system design, shift hours into <strong>LLM judgment</strong> and <strong>fundamentals</strong> — that delta is where most full-stack candidates lose points."></div>
+
+      <h2>What &ldquo;strong&rdquo; vs &ldquo;weak&rdquo; looks like</h2>
+      <p>Interviewers usually score each category on a rubric. Knowing the rubric is half the battle — it tells you what signal to send.</p>
+      <table>
+        <thead><tr><th>Category</th><th>Weak signal</th><th>Strong signal</th></tr></thead>
+        <tbody>
+          <tr><td>Practical coding</td><td>Happy-path only; ignores streaming/partial data; no error handling; freezes on a flaky failure.</td><td>Streams incrementally, handles partial/malformed chunks, retries with backoff, and reasons aloud about failure modes.</td></tr>
+          <tr><td>System design</td><td>Draws boxes; forgets metering, backpressure, and cost; treats the model as a normal synchronous service.</td><td>Designs for streaming, multi-tenant limits, caching, token metering, and graceful degradation under load.</td></tr>
+          <tr><td>LLM judgment</td><td>Reaches for fine-tuning first; assumes output is deterministic; no plan for injection or tool failure.</td><td>Picks the cheapest mechanism that works (prompt → RAG → fine-tune), designs for nondeterminism, and threat-models inputs.</td></tr>
+          <tr><td>Product sense</td><td>Builds everything; can&rsquo;t name a success metric; optimizes a vanity number.</td><td>Cuts ruthlessly to a testable slice, names a metric tied to user value, and states what would falsify it.</td></tr>
+          <tr><td>Fundamentals</td><td>Hand-waves the transformer; conflates training and prompting; no model of why long prompts cost more.</td><td>Explains attention, KV cache, prefill vs decode, and the cost/latency consequences in plain language.</td></tr>
+          <tr><td>Behavioral</td><td>Vague &ldquo;we&rdquo; stories; no conflict; no measurable outcome.</td><td>Specific &ldquo;I&rdquo; STAR stories with a real tradeoff, a decision owned, and a quantified result.</td></tr>
+        </tbody>
+      </table>
+
+      <h2>1 · Practical coding (LLM-flavored)</h2>
+      <p>Expect to actually write code. The grader cares about correctness on the unhappy path: partial streams, malformed JSON, a tool that throws, a rate limit that trips.</p>
+
+      <details class="quiz"><summary>Build a streaming chat endpoint that relays model tokens to the browser as they arrive.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you understand server-sent events / chunked transfer, async iteration over a model stream, and backpressure — or do you buffer the whole completion and defeat the point of streaming?</p>
+        <p><strong>Strong answer:</strong> Expose an endpoint that returns <code>text/event-stream</code>. Open the model stream with <code>stream=True</code>, async-iterate the deltas, and write each text chunk as an SSE <code>data:</code> frame, flushing immediately. Key details: flush per chunk (no buffering), send a terminal <code>[DONE]</code> sentinel, and wrap the loop in try/finally so a client disconnect or upstream error closes the stream cleanly instead of leaking the connection.</p>
+        <pre><code><span class="tok-key">async def</span> <span class="tok-fn">stream_chat</span>(req):
+    <span class="tok-key">async def</span> <span class="tok-fn">gen</span>():
+        <span class="tok-key">try</span>:
+            <span class="tok-key">async with</span> client.messages.stream(
+                model=<span class="tok-str">"claude-sonnet-4-6"</span>,
+                max_tokens=<span class="tok-num">1024</span>, messages=req.messages) <span class="tok-key">as</span> s:
+                <span class="tok-key">async for</span> text <span class="tok-key">in</span> s.text_stream:
+                    <span class="tok-key">yield</span> <span class="tok-str">f"data: "</span> + json.dumps({<span class="tok-str">"delta"</span>: text}) + <span class="tok-str">"\n\n"</span>
+            <span class="tok-key">yield</span> <span class="tok-str">"data: [DONE]\n\n"</span>
+        <span class="tok-key">except</span> Exception <span class="tok-key">as</span> e:
+            <span class="tok-key">yield</span> <span class="tok-str">f"event: error\ndata: "</span> + json.dumps({<span class="tok-str">"msg"</span>: <span class="tok-fn">str</span>(e)}) + <span class="tok-str">"\n\n"</span>
+    <span class="tok-key">return</span> StreamingResponse(gen(), media_type=<span class="tok-str">"text/event-stream"</span>)</code></pre>
+        <p>Bonus points: mention that you would forward token usage from the final event for metering, and that the client should render deltas incrementally rather than re-rendering the whole message.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Implement a tool-calling loop: the model can request tools, you run them, feed results back, and repeat until it produces a final answer.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you understand the agentic loop — the model emits tool-use blocks, you execute and return <code>tool_result</code> blocks, and you loop until <code>stop_reason</code> is no longer <code>tool_use</code>? And do you bound it?</p>
+        <p><strong>Strong answer:</strong> Maintain a running <code>messages</code> list. Each turn: call the model with the tool schemas; if <code>stop_reason == "tool_use"</code>, run each requested tool, append a user message containing the matching <code>tool_result</code> blocks (by <code>tool_use_id</code>), and loop; otherwise return the text. Guard it with a max-iteration cap and per-tool timeouts, and return a tool error as a result block (so the model can recover) rather than throwing.</p>
+        <pre><code>messages = [{<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: prompt}]
+<span class="tok-key">for</span> _ <span class="tok-key">in</span> <span class="tok-fn">range</span>(MAX_TURNS):
+    r = client.messages.create(model=<span class="tok-str">"claude-sonnet-4-6"</span>,
+        max_tokens=<span class="tok-num">1024</span>, tools=TOOLS, messages=messages)
+    messages.append({<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: r.content})
+    <span class="tok-key">if</span> r.stop_reason != <span class="tok-str">"tool_use"</span>:
+        <span class="tok-key">return</span> text_of(r)
+    results = [run_tool(b) <span class="tok-key">for</span> b <span class="tok-key">in</span> r.content <span class="tok-key">if</span> b.type == <span class="tok-str">"tool_use"</span>]
+    messages.append({<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: results})  <span class="tok-com"># tool_result blocks</span></code></pre>
+        <p>Call out: each <code>tool_result</code> must reference its <code>tool_use_id</code>; the cap prevents infinite loops; and a thrown tool should become <code>{"type":"tool_result","is_error":true,...}</code> so the model can retry or apologize gracefully.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Parse and validate structured output (JSON) from a model, given that it sometimes returns malformed or extra text.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you defend against nondeterministic output instead of assuming clean JSON? Do you know the difference between hoping and enforcing?</p>
+        <p><strong>Strong answer:</strong> First, prefer to <em>enforce</em> shape at the source — use tool/function calling or a structured-output mode with a schema, which is far more reliable than free-text JSON. Then still validate: parse against a schema (Pydantic / zod), and on failure, repair cheaply — extract the largest JSON object, retry once with the validation error fed back to the model, and only then fail loudly. Never silently accept partial data.</p>
+        <pre><code><span class="tok-key">def</span> <span class="tok-fn">parse_strict</span>(raw, Schema):
+    <span class="tok-key">try</span>:
+        <span class="tok-key">return</span> Schema.model_validate_json(raw)
+    <span class="tok-key">except</span> ValidationError <span class="tok-key">as</span> e:
+        fixed = client.messages.create(...,  <span class="tok-com"># one repair attempt</span>
+            messages=[{<span class="tok-str">"role"</span>:<span class="tok-str">"user"</span>,<span class="tok-str">"content"</span>:
+                <span class="tok-str">f"Return ONLY valid JSON. Errors to fix: "</span>+<span class="tok-fn">str</span>(e)}])
+        <span class="tok-key">return</span> Schema.model_validate_json(text_of(fixed))</code></pre>
+        <p>Strongest framing: &ldquo;I treat free-text JSON as a fallback. The reliable path is constrained generation via a tool schema; validation is the safety net, not the plan.&rdquo;</p>
+      </div></details>
+
+      <details class="quiz"><summary>An agent passes in tests but is flaky in production — sometimes it loops, sometimes it gives up early. How do you debug it?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you debug nondeterministic systems methodically — observability first, reproduce, isolate — rather than randomly tweaking the prompt?</p>
+        <p><strong>Strong answer:</strong> You can&rsquo;t fix what you can&rsquo;t see. First, add tracing: log every model call with full input/output, tool calls, token counts, latency, and stop reasons, tied to a request id. Then pull the failing traces and look for patterns — is it looping because a tool returns an ambiguous error the model keeps retrying? Giving up because the context filled and earlier instructions fell out? Temperature too high? Reproduce by replaying the exact message history. Fixes flow from the diagnosis: bound iterations, make tool errors explicit and actionable, lower temperature for the control path, and add an eval that captures the failing case so it can&rsquo;t silently regress.</p>
+        <p>Key line: &ldquo;Flaky LLM behavior is usually a missing-observability problem before it&rsquo;s a prompt problem.&rdquo;</p>
+      </div></details>
+
+      <details class="quiz"><summary>Implement a token-bucket rate limiter for per-API-key request limiting.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> A classic that&rsquo;s directly relevant to serving an LLM API. Do you understand the token-bucket algorithm and why it beats a naive fixed window (it allows bursts but bounds sustained rate)?</p>
+        <p><strong>Strong answer:</strong> Each key has a bucket with a capacity and a refill rate. On each request, lazily refill based on elapsed time (no background timer needed), then try to take a token; allow if available, else reject with a <code>429</code> and a <code>Retry-After</code> hint.</p>
+        <pre><code><span class="tok-key">def</span> <span class="tok-fn">allow</span>(key):
+    b = buckets[key]
+    now = time.monotonic()
+    b.tokens = <span class="tok-fn">min</span>(b.cap, b.tokens + (now - b.ts) * b.rate)
+    b.ts = now
+    <span class="tok-key">if</span> b.tokens &gt;= <span class="tok-num">1</span>:
+        b.tokens -= <span class="tok-num">1</span>
+        <span class="tok-key">return</span> <span class="tok-key">True</span>
+    <span class="tok-key">return</span> <span class="tok-key">False</span></code></pre>
+        <p>Bonus: mention that for a distributed fleet you&rsquo;d move the bucket into Redis with an atomic Lua script (or a sliding-window-counter) so limits hold across instances, and that for an LLM API you often rate-limit on <em>tokens</em>, not just requests, since cost scales with tokens.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Add retry with exponential backoff and jitter around a model call that can return 429 / 529 / transient 5xx.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Production resilience. Do you retry only retryable errors, cap attempts, respect <code>Retry-After</code>, and add jitter to avoid thundering herds?</p>
+        <p><strong>Strong answer:</strong> Retry only on overload/transient codes (429, 529, 500/502/503), not on 400/401/422 (those are bugs in your request). Sleep <code>min(cap, base * 2**attempt)</code> plus random jitter, honoring a server <code>Retry-After</code> header when present, with a hard attempt cap. Make the operation idempotent or use an idempotency key so a retry can&rsquo;t double-charge or double-act.</p>
+        <pre><code><span class="tok-key">for</span> attempt <span class="tok-key">in</span> <span class="tok-fn">range</span>(MAX):
+    <span class="tok-key">try</span>:
+        <span class="tok-key">return</span> call()
+    <span class="tok-key">except</span> Transient <span class="tok-key">as</span> e:
+        <span class="tok-key">if</span> attempt == MAX - <span class="tok-num">1</span>: <span class="tok-key">raise</span>
+        delay = <span class="tok-fn">min</span>(CAP, BASE * <span class="tok-num">2</span>**attempt) + random.random()
+        time.sleep(e.retry_after <span class="tok-key">or</span> delay)</code></pre>
+      </div></details>
+
+      <details class="quiz"><summary>Write a function that estimates the cost of a request before sending it, given token counts and a model price table.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Cost awareness — do you internalize that input and output tokens are priced differently and that cached input is cheaper?</p>
+        <p><strong>Strong answer:</strong> Separate the meter into input, output, and cached-input buckets, each with its own per-million-token rate, since output is typically several times the price of input and cache reads are a large discount on input.</p>
+        <pre><code><span class="tok-key">def</span> <span class="tok-fn">cost</span>(in_tok, out_tok, cached_tok, price):
+    <span class="tok-key">return</span> ((in_tok - cached_tok) * price.inp
+          + cached_tok * price.cache_read
+          + out_tok * price.out) / <span class="tok-num">1_000_000</span></code></pre>
+        <p>Strong candidates add: estimate input tokens with a tokenizer before sending so you can reject oversized requests, and budget output via <code>max_tokens</code> since output dominates both cost and latency.</p>
+      </div></details>
+
+      <h3>The agent loop, visualized</h3>
+      <div class="viz" data-viz="flow"
+        data-title="Tool-calling loop — what a strong coding answer implements"
+        data-sub="The same loop the interviewer wants to see you bound and make resilient."
+        data-steps='[{"op":"Call model","shape":"messages + tools","note":"Send the running conversation plus the available tool schemas."},{"op":"Check stop reason","shape":"tool_use?","note":"If the model just wants to talk, you are done — return the text. If it requested tools, continue."},{"op":"Run tools","shape":"execute + capture","note":"Run each requested tool with a timeout. Catch exceptions and turn them into tool_result blocks with is_error so the model can recover."},{"op":"Append results","shape":"tool_result by id","note":"Add a user message whose content is the tool_result blocks, each keyed to its tool_use_id."},{"op":"Loop or stop","shape":"bounded by MAX_TURNS","note":"Repeat. A hard iteration cap prevents infinite loops when a tool keeps failing."}]'
+        data-cap="The two failure modes interviewers watch for: <strong>unbounded loops</strong> (no cap) and <strong>brittle tool errors</strong> (throwing instead of returning an error result the model can act on)."></div>
+
+      <h2>2 · Full-stack / system design</h2>
+      <p>Short prompts here — say the shape of the design and the three things most people forget. (Deep end-to-end designs live on the walkthroughs page.)</p>
+
+      <details class="quiz"><summary>Design an LLM completion API with streaming and per-customer usage metering.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Can you serve a streaming, billable, multi-tenant service — not just proxy a model?</p>
+        <p><strong>Strong answer:</strong> A gateway authenticates the API key and checks quota; a request service streams tokens back via SSE while accumulating usage; on stream end (and on disconnect) it writes a usage record (input/output/cached tokens, model, latency) to a durable, idempotent ledger keyed by request id. Metering must survive client disconnects — meter from the upstream stream, not the client connection. Aggregate the ledger asynchronously for billing and dashboards. Mention queueing/admission control for overload and emitting usage in the final stream event so clients can show it.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How would you add prompt caching to cut cost and latency on requests that share a large common prefix?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you understand <em>why</em> caching helps (it reuses the KV cache for an unchanged prefix, skipping prefill) and how to structure prompts to benefit?</p>
+        <p><strong>Strong answer:</strong> Caching works on a stable <em>prefix</em>: the model can reuse the computed attention state for tokens that haven&rsquo;t changed, so you pay full price once and a steep discount on subsequent hits. Design for it by putting the large, stable content first — system prompt, tool definitions, big documents, few-shot examples — and the variable user input last. Mark the cache breakpoint at the end of the stable region. Pitfalls: caches have a short TTL so low-traffic prefixes won&rsquo;t stay warm; any byte change before the breakpoint busts the cache; and order matters (don&rsquo;t interleave volatile content into the stable prefix).</p>
+      </div></details>
+
+      <details class="quiz"><summary>Design multi-tenant rate limiting for an API where tenants have very different plans.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Fairness, isolation, and distributed enforcement.</p>
+        <p><strong>Strong answer:</strong> Per-tenant token buckets (limit on both requests and tokens-per-minute, since cost scales with tokens), enforced in a shared store (Redis with an atomic script) so limits hold across all instances. Add a global ceiling so the fleet can&rsquo;t be overwhelmed even if every tenant is under their own limit (the &ldquo;noisy neighbor&rdquo; protection), return <code>429</code> with <code>Retry-After</code>, and consider priority tiers / weighted fair queueing so paying tenants degrade last. Surface usage headers so clients can self-throttle.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Design a RAG system for answering questions over a company&rsquo;s internal docs.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you know the retrieval pipeline end to end, and where quality actually breaks (it&rsquo;s usually retrieval, not the model)?</p>
+        <p><strong>Strong answer:</strong> Offline: chunk documents thoughtfully (semantic boundaries, modest overlap), embed, and index in a vector store with metadata for filtering and access control. Online: embed the query, retrieve top-k (ideally hybrid — dense + keyword — then rerank), assemble a prompt with the chunks and a citation instruction, and generate. Critical details: enforce per-user permissions at retrieval time, cite sources, handle &ldquo;no good context&rdquo; by saying so instead of hallucinating, and evaluate retrieval (recall@k) separately from generation. Most RAG failures are retrieval failures — invest there first.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Design an agent platform that lets internal teams build and run agents with custom tools.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Systems thinking about the agentic loop at platform scale — isolation, observability, safety, cost.</p>
+        <p><strong>Strong answer:</strong> Core pieces: a tool registry with typed schemas and permissions; a sandboxed execution layer for tools (untrusted code/network must be isolated); an orchestration loop with per-run iteration and token budgets; durable run state so a long agent can pause/resume and survive crashes; and full tracing of every step. Cross-cutting: per-team rate limits and cost budgets, an eval harness to catch regressions before rollout, human-in-the-loop approval for high-risk actions, and prompt-injection defenses since tools ingest untrusted data. Make observability and cost controls first-class, not afterthoughts.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you choose where to run inference — hosted API vs self-hosted — for a new product feature?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Pragmatic build-vs-buy judgment, not dogma.</p>
+        <p><strong>Strong answer:</strong> Default to a hosted API: you get frontier quality, no GPU ops, elastic scale, and features like caching and tool use for free — ship and learn fast. Consider self-hosting only when a concrete driver forces it: strict data-residency/compliance, scale where unit economics flip, very tight latency needs, or a specialized fine-tuned model. Even then, start hosted to validate the product, then migrate the hot path. The mistake is self-hosting prematurely and spending your runway on infra instead of the product.</p>
+      </div></details>
+
+      <h2>3 · LLM-specific design &amp; judgment</h2>
+
+      <details class="quiz"><summary>How do you build a reliable agent when tools fail intermittently?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Designing for failure in a system whose controller (the model) is itself nondeterministic.</p>
+        <p><strong>Strong answer:</strong> Treat tools like any unreliable dependency: timeouts, bounded retries with backoff at the tool layer, and idempotency for anything with side effects. Crucially, surface failures back to the model as structured, actionable error results (&ldquo;the search API timed out, try a narrower query&rdquo;) rather than throwing — the model can often route around a failure. Bound the overall loop with an iteration/budget cap, define a graceful fallback (degrade to a partial answer or hand off to a human), and trace everything so you can see where loops form. Reliability comes from the harness, not from hoping the model behaves.</p>
+      </div></details>
+
+      <details class="quiz"><summary>A conversation is about to exceed the context window. What do you do?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Practical context management and awareness of cost/latency consequences.</p>
+        <p><strong>Strong answer:</strong> Don&rsquo;t just truncate blindly. Keep the system prompt and the most recent turns verbatim, and compress the middle: summarize older turns into a running summary, or retrieve only the relevant past turns (RAG over the history). Move large reference material out of the prompt and fetch on demand via tools. Track token counts proactively and trigger compaction before you hit the wall, not after a hard failure. Mention the tradeoff: bigger context costs more and adds latency (more to prefill), and quality can degrade when key details are buried — so smaller, well-curated context often beats stuffing everything in.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you choose a model for a feature — trading off cost, latency, and quality?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you match model capability to the task instead of defaulting to the biggest model?</p>
+        <p><strong>Strong answer:</strong> Start from the task&rsquo;s quality bar and latency budget, then pick the cheapest model that clears it. Use a tiered approach: a fast, cheap model (e.g. Haiku 4.5) for classification, routing, extraction, and high-volume simple calls; a balanced model (Sonnet 4.6) for most product features; and the most capable model (Opus 4.8) for hard reasoning, complex agents, and quality-critical paths. Validate the choice with an eval set on your real data rather than vibes, and consider routing — cheap model first, escalate to a stronger one only when confidence is low. Re-evaluate as new models ship; the frontier moves.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you make structured output reliable enough to depend on programmatically?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Whether you enforce structure or merely hope for it.</p>
+        <p><strong>Strong answer:</strong> Constrain generation at the source — use tool/function calling or a structured-output mode bound to a JSON schema, which is far more reliable than asking for JSON in prose. Provide a clear, typed schema with examples, keep temperature low for these calls, then validate against the schema on receipt. On validation failure, do one bounded repair pass feeding the error back, then fail loudly. And put an eval in place that measures schema-conformance rate on real inputs so regressions are caught.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you defend an LLM feature against prompt injection?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Security mindset for systems that ingest untrusted text (RAG docs, web pages, tool outputs, user input).</p>
+        <p><strong>Strong answer:</strong> Assume any untrusted content the model reads may contain instructions, and that you cannot fully prevent the model from following them with prompting alone. So defend at the boundary: never let model output trigger a high-privilege action without authorization — gate side-effecting tools behind allowlists, scoped permissions, and human approval for destructive ones. Separate trusted instructions from untrusted data (clear delimiters, label provenance), apply least privilege to every tool, sanitize/escape outputs before they hit other systems (avoid downstream injection), and add detection/eval for known attack patterns. The core principle: <strong>treat the model as an untrusted actor and put real authorization checks between it and anything dangerous.</strong></p>
+      </div></details>
+
+      <details class="quiz"><summary>When should you fine-tune instead of prompting or using RAG?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Cost-aware judgment; fine-tuning is often the wrong first reach.</p>
+        <p><strong>Strong answer:</strong> Climb the ladder cheapest-first. <em>Prompting</em> (with good instructions and few-shot examples) solves most tasks. <em>RAG</em> adds fresh or proprietary <em>knowledge</em>. <em>Fine-tuning</em> changes <em>behavior/format/style</em> or bakes in a narrow skill — reach for it when prompting has plateaued, you have quality labeled data, the task is stable, and you need consistency, lower latency, or smaller-model economics at volume. Fine-tuning doesn&rsquo;t teach new facts well (use RAG) and carries data and maintenance cost. Most teams over-reach for fine-tuning when a better prompt or retrieval would do.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you build an eval for an LLM feature so you can ship changes with confidence?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you treat LLM features like software that needs a test suite, given nondeterminism?</p>
+        <p><strong>Strong answer:</strong> Build a dataset of real, representative inputs with expected outcomes (or acceptance criteria). Score with the cheapest valid method: exact/programmatic checks where possible (schema conformance, contains-answer, tool-called-correctly), and an LLM-as-judge with a clear rubric for open-ended quality — calibrated against some human labels. Run it in CI on every prompt/model change, track aggregate scores plus regressions on specific cases, and grow the set by adding every production failure as a new case. Evals are how you turn &ldquo;it feels better&rdquo; into a number you can defend.</p>
+      </div></details>
+
+      <h2>4 · Product sense</h2>
+
+      <details class="quiz"><summary>You have two weeks and an LLM. What do you ship, and what do you cut?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Ruthless scoping and judgment about where the model earns its keep.</p>
+        <p><strong>Strong answer:</strong> Pick the single highest-value, lowest-risk slice where the model&rsquo;s nondeterminism is tolerable — usually an assistive, human-in-the-loop feature (draft/suggest, not auto-execute) on a narrow domain. Ship: that one workflow end to end, with streaming for perceived speed, basic guardrails, and logging/evals from day one. Cut: broad scope, full automation, fine-tuning, exotic infra, and edge cases — fast model and hosted API. The goal in two weeks is a real thing in users&rsquo; hands that produces signal, not a polished platform. State the cut explicitly: &ldquo;I&rsquo;d ship the assist and defer autonomy until the eval data earns it.&rdquo;</p>
+      </div></details>
+
+      <details class="quiz"><summary>Which metric proves your LLM feature works — and why do vanity metrics lie?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you connect the feature to real user value, not activity theater?</p>
+        <p><strong>Strong answer:</strong> Pick a metric tied to the user&rsquo;s actual goal and to retention/value: task completion rate, edit distance between the model&rsquo;s draft and what the user shipped (lower = more useful), time-to-done, or downstream conversion/retention. Vanity metrics — number of messages sent, tokens generated, &ldquo;engagement&rdquo; — go up when the product is <em>worse</em> (users retry because it failed) and reward verbosity. The tell of a strong answer: name the metric, name the vanity trap it avoids, and say what result would make you <em>kill</em> the feature.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Users say &ldquo;the agent is too slow.&rdquo; How do you diagnose and fix it?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Latency literacy specific to LLMs (it&rsquo;s not one number) plus a measure-first instinct.</p>
+        <p><strong>Strong answer:</strong> First decompose &ldquo;slow&rdquo;: is it time-to-first-token (perceived responsiveness) or total completion time? Measure the breakdown — prefill (scales with input size), decode (scales with output tokens), number of sequential model round-trips in the agent loop, and tool latency. Then attack the dominant term: stream to fix perceived latency; shrink output with tighter prompts and <code>max_tokens</code>; cut input via prompt caching and trimming context to fix prefill; use a faster model (Haiku) for sub-steps; parallelize independent tool calls; and reduce the number of sequential loop turns. Measure, don&rsquo;t guess — the bottleneck is usually one of these, not all.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you prioritize when the goal is ambiguous and stakeholders disagree?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Decision-making under ambiguity — a core lab trait.</p>
+        <p><strong>Strong answer:</strong> Reduce ambiguity into something testable. Write down the hypothesized user problem and the riskiest assumption, then pick the cheapest experiment that would falsify it (a prototype, a manual Wizard-of-Oz, a quick eval). Sequence by value-over-effort and by what unblocks learning fastest. Make the call explicitly, write down the reasoning and what would change your mind, and revisit when data arrives. The strong signal is bias to action with a paper trail — you don&rsquo;t wait for consensus, you create evidence that forms it.</p>
+      </div></details>
+
+      <details class="quiz"><summary>The model is good enough but adoption is low. What do you look at?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Product instinct that quality &ne; adoption.</p>
+        <p><strong>Strong answer:</strong> Adoption usually dies on trust, discoverability, or fit — not raw quality. Look at the funnel: do users find the feature, try it once, and come back? Watch session recordings / talk to users. Common culprits: latency makes it feel broken, one bad early output destroys trust, the workflow doesn&rsquo;t fit where users actually work, or there&rsquo;s no obvious moment of value. Fixes are often product, not model: better defaults, faster first token, an obvious entry point, graceful failure, and showing the user it&rsquo;s working. Instrument the funnel before theorizing.</p>
+      </div></details>
+
+      <h2>5 · Fundamentals</h2>
+      <p>You don&rsquo;t need to derive backprop, but you must explain these in plain language and connect them to cost and latency. That connection is the signal.</p>
+
+      <details class="quiz"><summary>Roughly how does a transformer generate text?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> A correct, non-hand-wavy mental model at the right altitude.</p>
+        <p><strong>Strong answer:</strong> Text is split into tokens, each mapped to a vector. The model is a stack of layers; the key operation is <em>attention</em>, where every token looks at the other tokens and pulls in relevant context, building richer representations layer by layer. The final layer produces a probability distribution over the next token; you sample one, append it, and repeat — generation is autoregressive, one token at a time. Two consequences worth naming: attention cost grows with sequence length (longer context is more expensive), and because it&rsquo;s token-by-token, output length drives latency.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Why do longer prompts cost more and run slower?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> The link between architecture and the bill.</p>
+        <p><strong>Strong answer:</strong> Two reasons. Cost: you&rsquo;re billed per input token, so more prompt = more input tokens directly. Latency: before generating anything, the model must process the entire prompt (prefill), and attention work grows with length — so a long prompt raises time-to-first-token. The fixes follow directly: trim context, and use prompt caching so an unchanged prefix is processed once and reused, cutting both repeat cost and prefill latency.</p>
+      </div></details>
+
+      <details class="quiz"><summary>What is the KV cache and why does it matter?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Do you understand the single most important inference optimization?</p>
+        <p><strong>Strong answer:</strong> During generation, attention needs the keys and values of all previous tokens. Recomputing them for every new token would be quadratic and wasteful, so the model caches them — the KV cache — and only computes K/V for the newest token each step. That&rsquo;s what makes decoding roughly linear instead of explosive. The cache lives in GPU memory and grows with sequence length and batch size, so it&rsquo;s often the real memory constraint on how long a context or how many concurrent requests you can serve. Prompt caching is essentially persisting/reusing this state for a shared prefix.</p>
+      </div></details>
+
+      <details class="quiz"><summary>What&rsquo;s the difference between prefill and decode?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> The two-phase nature of inference, which explains latency behavior.</p>
+        <p><strong>Strong answer:</strong> Prefill processes the whole input prompt in one parallel pass and populates the KV cache — it&rsquo;s compute-bound and its cost scales with input length; it determines time-to-first-token. Decode then generates output tokens one at a time, each step reusing the KV cache — it&rsquo;s memory-bandwidth-bound and its cost scales with output length; it determines the time between tokens. This is why a huge prompt with a short answer is slow to start but quick to finish, and why streaming hides decode latency.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Training vs fine-tuning vs RAG vs prompting — what does each change?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Clean mental boundaries between the four levers.</p>
+        <p><strong>Strong answer:</strong> <em>Pretraining</em> creates the base model&rsquo;s general capabilities (massive, done by the lab). <em>Prompting</em> steers the existing model at runtime with instructions and examples — cheapest, most flexible. <em>RAG</em> injects external/proprietary <em>knowledge</em> into the prompt at runtime via retrieval — best for facts that change or are private. <em>Fine-tuning</em> updates the model&rsquo;s weights to shift <em>behavior, style, or a narrow skill</em> — best when prompting plateaus and you have data. Rule of thumb: prompt first, RAG for knowledge, fine-tune for behavior — and only climb the ladder when the cheaper rung stops working.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Why is temperature relevant, and when do you turn it down?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Practical control over the sampling step.</p>
+        <p><strong>Strong answer:</strong> Temperature controls how randomly the next token is sampled from the model&rsquo;s probability distribution — higher means more diverse/creative, lower means more deterministic and focused. Turn it down (near 0) for tasks that need consistency and correctness: structured output, classification, extraction, tool routing, and the control path of an agent. Keep it higher for brainstorming or creative writing. It&rsquo;s a knob for the variance you&rsquo;re willing to accept, not a quality dial.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Why is LLM output nondeterministic, and what does that mean for how you build?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> The mindset shift from deterministic software.</p>
+        <p><strong>Strong answer:</strong> Generation samples from a probability distribution, so the same input can yield different outputs (and even at temperature 0, floating-point and batching effects mean it isn&rsquo;t guaranteed identical). The implication: you can&rsquo;t write a normal equality test, and you can&rsquo;t assume a format will hold. So you build for it — validate and constrain outputs, use evals with tolerance/rubrics instead of exact matches, design idempotent and bounded loops, and put authorization between the model and dangerous actions. Treating the model as a deterministic function is the root of most LLM bugs.</p>
+      </div></details>
+
+      <h2>6 · Behavioral / ownership</h2>
+      <p>Labs hire for agency and judgment. Use <strong>STAR</strong> — Situation, Task, Action, Result — and make the Action mostly &ldquo;I,&rdquo; the Result quantified. The callout below shows the shape; the toggles show what each prompt is really testing.</p>
+
+      <div class="callout key">
+        <span class="label">Structure every story with STAR</span>
+        <p><strong>S</strong>ituation (1–2 sentences of context) → <strong>T</strong>ask (what was on you specifically) → <strong>A</strong>ction (the bulk: what <em>you</em> did and why you chose it over alternatives) → <strong>R</strong>esult (a number, plus what you learned). Keep S and T short; spend your time on A and R. Prepare 5–6 stories that you can flex to cover most prompts.</p>
+      </div>
+
+      <details class="quiz"><summary>Tell me about a 0→1 thing you shipped.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Can you build from nothing, scope ruthlessly, and get something real in front of users? This is the defining product-eng trait.</p>
+        <p><strong>Strong answer (shape):</strong> Pick a project you drove from idea to live. <em>S/T:</em> the gap and why it was yours. <em>A:</em> how you scoped the first slice, the build/buy calls, what you cut to ship fast, how you got it in front of users. <em>R:</em> adoption/impact number and what you learned about the users. The signal: you optimized for learning speed and shipped, rather than gold-plating. Name a concrete cut you made and defend it.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Describe a hard technical tradeoff you made.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Engineering judgment — that you reason about tradeoffs explicitly rather than defaulting.</p>
+        <p><strong>Strong answer (shape):</strong> Pick a real fork (e.g. ship-fast-with-a-hosted-API vs build-the-robust-thing; latency vs cost; quality vs scope). Lay out the options, the constraints, the decision criteria, what you chose and <em>why</em>, and how it turned out — including what you&rsquo;d revisit. The signal is a clear decision framework and ownership of the consequences, not that the choice was perfect.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Tell me about a failure and what changed because of it.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Honesty, accountability, and whether you actually learn (do you institutionalize the fix?).</p>
+        <p><strong>Strong answer (shape):</strong> A real failure you owned — a bad call, a missed risk, an outage. Take responsibility without deflecting, explain the root cause, and crucially describe the <em>systemic</em> change you made so it can&rsquo;t recur (an eval added, a guardrail, a process). <em>R:</em> the improvement since. Avoid humble-brags (&ldquo;I worked too hard&rdquo;); pick something that genuinely stung and show the growth.</p>
+      </div></details>
+
+      <details class="quiz"><summary>How do you move fast without breaking trust?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Whether speed and responsibility coexist in you — labs ship fast but on systems people rely on.</p>
+        <p><strong>Strong answer (shape):</strong> Speed comes from de-risking, not from skipping safety. Concrete habits: ship behind flags and to small cohorts first, instrument and eval before broad rollout, keep changes reversible, communicate proactively, and reserve the brakes for genuinely irreversible or high-blast-radius actions (where you slow down and get a second set of eyes). Tell a story where you shipped quickly <em>and</em> caught/contained a problem because of these habits.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Give an example of being high-agency — doing something outside your lane.</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> The single most-valued trait at a lab: you see a problem and own it without being told.</p>
+        <p><strong>Strong answer (shape):</strong> A time you spotted a problem nobody assigned you — a broken workflow, a missing tool, a gap between teams — and just fixed it, navigating ambiguity and pulling others in. <em>A:</em> how you identified it, took initiative, and drove it to done despite it not being &ldquo;your job.&rdquo; <em>R:</em> the impact. The signal: bias to action and ownership of outcomes over scope. Have two of these ready — it&rsquo;s the question most likely to decide the loop.</p>
+      </div></details>
+
+      <details class="quiz"><summary>Why do you want to work at an AI lab on product engineering specifically?</summary><div class="answer">
+        <p><strong>What they&rsquo;re probing:</strong> Genuine motivation and that you understand the role isn&rsquo;t pure research or pure web dev.</p>
+        <p><strong>Strong answer (shape):</strong> Be specific and honest: you want to be at the layer where frontier models meet real users — turning raw capability into reliable products — and you&rsquo;re energized by the pace, the ambiguity, and the leverage. Tie it to something you&rsquo;ve actually built with these models and what you learned. Avoid generic hype; show you&rsquo;ve thought about the hard parts (reliability, cost, safety) and want to work on them.</p>
+      </div></details>
+
+      <h2>One week out: a quick checklist</h2>
+      <table>
+        <thead><tr><th>Do</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Build one small real thing (streaming chat + a tool loop) end to end.</td><td>The coding round rewards muscle memory you only get by building, not reading.</td></tr>
+          <tr><td>Be able to draw the agent loop and the request lifecycle from memory.</td><td>They anchor most coding and design rounds.</td></tr>
+          <tr><td>Memorize the cost/latency story: input vs output tokens, prefill vs decode, KV cache, caching.</td><td>This is the fundamentals signal and it threads through every round.</td></tr>
+          <tr><td>Prepare 5–6 STAR stories, at least two high-agency.</td><td>Behavioral is often the deciding round; don&rsquo;t improvise it.</td></tr>
+          <tr><td>Practice scoping out loud: &ldquo;here&rsquo;s what I&rsquo;d ship and what I&rsquo;d cut.&rdquo;</td><td>Product sense is judged on what you say no to.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha</span>
+        <p>The most common way strong full-stack engineers lose these loops isn&rsquo;t a missing data-structure trick — it&rsquo;s <strong>treating the model as a deterministic, free, instant function call.</strong> Buffer the whole completion, assume the JSON is clean, ignore token cost, leave the loop unbounded, and skip evals — every one of those is a points deduction. Show that you internalize nondeterminism, cost, latency, and reliability, and you&rsquo;ll stand out.</p>
+      </div>
+
+      <div class="callout analogy">
+        <span class="label">Last thing</span>
+        <p>Interviewers aren&rsquo;t looking for a perfect answer; they&rsquo;re looking for how you think when the problem is open and the component is unreliable. Reason out loud, name your tradeoffs, and reach for the cheapest mechanism that works. That posture — calm, concrete, cost-aware, reliability-first — is exactly the job.</p>
+      </div>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

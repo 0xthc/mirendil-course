@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P7 · Product system design</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P7</div>
+      <h1>Product system design</h1>
+      <p class="lede">A raw model endpoint is not a product. Between your customers and the model sits a platform: it authenticates callers, keeps tenants apart, rate-limits them, caches what it can, routes to the right model, meters every token, and stays up when a provider hiccups. This page teaches those building blocks one at a time, so that when an interviewer says “design the LLM API platform,” you already have the boxes and the lines.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Think of the model as a brilliant but expensive chef. You don’t let every customer walk straight into the kitchen. You put a host out front (the gateway): they check your reservation (auth), make sure one table can’t order the entire menu and starve everyone else (rate limits), reuse a sauce that’s already simmering instead of starting over (caching), send simple orders to the line cook and only the hard ones to the head chef (routing), and hand you an itemised bill on the way out (metering). The platform is everything that isn’t the cooking.</p>
+      </div>
+
+      <h2>The shape of an LLM API platform</h2>
+      <p>Almost every model-backed product converges on the same spine: a <strong>client</strong> sends a request, a <strong>gateway</strong> does the cross-cutting work (auth, limits, routing, logging), one or more <strong>model providers</strong> do the inference, and tokens <strong>stream</strong> back through the gateway to the client. Everything else on this page hangs off that spine.</p>
+
+      <div class="diagram">
+        <strong>Request path, front to back</strong><br><br>
+        Client (app / SDK)<br>
+        &nbsp;&nbsp;│ &nbsp;HTTPS, API key, prompt<br>
+        ▼<br>
+        ── Gateway ───────────────────────────────<br>
+        &nbsp;&nbsp;• Auth &amp; tenant resolution<br>
+        &nbsp;&nbsp;• Rate-limit &amp; quota check (req + tokens)<br>
+        &nbsp;&nbsp;• Prompt-cache lookup<br>
+        &nbsp;&nbsp;• Model routing &amp; fallback<br>
+        &nbsp;&nbsp;• Queue / admission control<br>
+        ───────────────────────────────────────────<br>
+        &nbsp;&nbsp;│ &nbsp;routed call (with timeout + retry budget)<br>
+        ▼<br>
+        Model provider(s) ──► token stream<br>
+        ▲<br>
+        &nbsp;&nbsp;│ &nbsp;stream relayed back, usage metered<br>
+        Client receives SSE / chunked tokens<br>
+        <div class="cap">The gateway is the one place every request passes through — which is exactly why it owns auth, limits, caching, routing, and metering. Keep it stateless so you can run many copies behind a load balancer; push shared state (counters, cache, usage) into fast stores beside it.</div>
+      </div>
+
+      <div class="viz" data-viz="flow"
+        data-title="One request through the platform"
+        data-sub="Step through the lifecycle of a single chat completion."
+        data-steps='[
+          {"op":"Client sends request","shape":"POST /v1/messages + API key","note":"The app or SDK opens an HTTPS request carrying the API key, the model name, the prompt, and stream=true. This is the only thing the customer controls."},
+          {"op":"Authenticate","shape":"key → tenant + scopes","note":"The gateway hashes the API key, looks it up, and resolves which tenant (customer/org) and which scopes it maps to. Invalid or revoked key → 401, no model call ever happens."},
+          {"op":"Rate-limit & quota check","shape":"requests AND tokens","note":"Check this tenant against two ceilings: requests-per-minute and tokens-per-minute. Estimate the request’s token cost up front. Over the limit → 429 with Retry-After. Within limit → reserve the budget."},
+          {"op":"Prompt-cache lookup","shape":"hash(stable prefix)","note":"Hash the stable prefix (system prompt, tools, long shared context). On a hit, the provider skips re-reading those tokens — big latency and cost win. The dynamic tail (the user’s new turn) is always processed fresh."},
+          {"op":"Route to a model","shape":"task → Haiku | Sonnet | Opus","note":"Pick a model by task class, tenant tier, or explicit request. Cheap/fast model for simple work; the strong model only when needed. Attach a per-attempt timeout and a retry/fallback budget."},
+          {"op":"Call provider + stream","shape":"SSE tokens relayed live","note":"Send the call. As the provider emits tokens, relay each chunk to the client immediately so time-to-first-token stays low. If the primary errors or times out, fail over to the configured fallback within budget."},
+          {"op":"Meter usage","shape":"input + output tokens → ledger","note":"On completion, read the exact input and output token counts from the provider response, attribute them to the tenant (and API key, and feature), and write a usage event. This feeds billing, quotas, and dashboards."}
+        ]'
+        data-cap="Auth → limits → cache → route → stream → meter. Notice the order: the cheapest rejections (bad key, over quota) happen <strong>before</strong> any expensive model call, and metering happens <strong>after</strong> you know the real token counts."></div>
+
+      <div class="callout key">
+        <span class="label">The load-bearing idea</span>
+        <p>The gateway should be <strong>stateless</strong>; the <strong>state</strong> lives in shared stores beside it — rate-limit counters and the prompt cache in a fast in-memory store (e.g. Redis), usage events in a durable log/warehouse. That split is what lets you scale the gateway horizontally and survive the loss of any single instance. Almost every design answer on this page comes back to “stateless gateway, shared fast state.”</p>
+      </div>
+
+      <h2>Auth &amp; multi-tenancy</h2>
+      <p>A multi-tenant platform serves many customers from shared infrastructure while making each one feel alone. Three layers do the work:</p>
+      <ul>
+        <li><strong>API keys.</strong> Each tenant gets one or more keys. Store only a hash of the key (treat it like a password), prefix it so it’s greppable in logs without leaking the secret, and support rotation and per-key scopes (e.g. a read-only key, a key limited to one model).</li>
+        <li><strong>Tenant resolution.</strong> The first thing the gateway does after auth is turn a key into a <code>tenant_id</code>. Everything downstream — limits, cache namespaces, usage rows, logs — is keyed by that ID. A request with no tenant is a bug, not a fallback.</li>
+        <li><strong>Isolation.</strong> Tenants must not see each other’s data, and one tenant’s traffic must not degrade another’s. Namespace the cache per tenant (so prompts never collide or leak across customers), tag every log and trace with the tenant, and enforce per-tenant quotas so a noisy neighbour can’t consume the whole pool.</li>
+      </ul>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha: the shared prompt cache that leaks</span>
+        <p>A naïve cache key is just <code>hash(prompt)</code>. Now two different tenants who happen to send the same system prompt share a cache entry — and depending on your design, one could observe that the other is also using it (a timing side-channel), or worse, you key responses by prompt and serve tenant A’s cached completion to tenant B. <strong>Always include the tenant in the cache key</strong> (<code>hash(tenant_id + prefix)</code>) unless you have a deliberate, audited reason to share, and never cache the <em>response</em> across tenants by default.</p>
+      </div>
+
+      <h2>Rate limiting &amp; quotas</h2>
+      <p>Rate limiting protects the platform (and the upstream provider) from being overwhelmed, and enforces fairness so one tenant can’t starve the rest. Two design choices matter: the <em>algorithm</em> and the <em>unit</em>.</p>
+
+      <h3>Token bucket vs sliding window</h3>
+      <table>
+        <thead><tr><th>Algorithm</th><th>How it works</th><th>Feel</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Token bucket</strong></td><td>Each tenant has a bucket that refills at a steady rate (e.g. 100 units/sec) up to a max capacity. Each request spends units. Empty bucket → reject.</td><td>Allows <em>bursts</em> up to the bucket size, then settles to the refill rate. Cheap: one counter + timestamp per tenant.</td></tr>
+          <tr><td><strong>Sliding window</strong></td><td>Count events in the trailing window (e.g. last 60s). If the count exceeds the limit, reject. A “sliding log” keeps timestamps; a “sliding counter” approximates with weighted buckets.</td><td>Smoother, harder limit on “requests per minute”; no big burst allowance. Slightly more state/compute.</td></tr>
+        </tbody>
+      </table>
+      <p>In practice many platforms use a token bucket for its burst tolerance and cheap state, and reserve sliding windows for hard contractual ceilings. The key is that the counter lives in a <strong>shared store</strong> so every stateless gateway instance sees the same tally.</p>
+
+      <h3>Limit by requests AND by tokens</h3>
+      <p>This is the LLM-specific twist. A classic API limits <em>requests per minute</em> (RPM). But LLM cost and load scale with <strong>tokens</strong>, not requests: one request with a 200k-token context can cost more than a thousand tiny ones. So you enforce two ceilings at once — <strong>RPM</strong> and <strong>TPM</strong> (tokens per minute) — and often a separate budget for input vs output tokens, since output is generated serially and is the latency bottleneck.</p>
+      <p>The wrinkle: you don’t know the exact output token count until the response finishes. So you <strong>estimate</strong> the cost up front (input tokens are known; output is bounded by <code>max_tokens</code>), <em>reserve</em> that budget at admission, then <strong>reconcile</strong> against the real usage when the response completes — refunding or charging the difference back to the bucket.</p>
+
+      <div class="callout key">
+        <span class="label">Fairness &amp; backpressure</span>
+        <p>Per-tenant buckets give you fairness for free: each tenant draws from its own budget, so a spike from one can’t drain another’s. When a tenant is over its limit, return <strong>429 Too Many Requests</strong> with a <code>Retry-After</code> header — this is <em>backpressure</em>, an explicit signal that tells well-behaved clients to slow down rather than hammer you harder. Combine per-tenant limits with a global ceiling that protects the upstream provider from the sum of all tenants.</p>
+      </div>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha: limiting only by request count</span>
+        <p>If you cap RPM but not TPM, a single tenant sending huge-context requests can blow your provider budget and tank latency for everyone while technically staying “under the limit.” Token-aware limiting is not optional for an LLM platform — it’s the whole point.</p>
+      </div>
+
+      <h2>Usage metering &amp; billing</h2>
+      <p>Every request consumes input and output tokens, and tokens cost money — at different rates per model and (with caching) per cache state. Metering is how you turn raw traffic into quotas, dashboards, and invoices.</p>
+      <ul>
+        <li><strong>Count per request.</strong> When a response completes, record <code>input_tokens</code>, <code>output_tokens</code>, and any cache-read / cache-write token counts, plus the model used. The provider returns these — don’t re-tokenize and guess.</li>
+        <li><strong>Emit a usage event.</strong> Write one immutable event per request to a durable stream: <code>{tenant_id, api_key_id, model, input_tok, output_tok, cache_read_tok, ts}</code>. This is the source of truth; treat it like an append-only ledger.</li>
+        <li><strong>Aggregate.</strong> Roll events up by tenant, by day, by model, by feature. Aggregation feeds both the customer-facing dashboard and the monthly invoice.</li>
+        <li><strong>Attribute cost.</strong> Cost = Σ(tokens × per-token price for that model and cache state). Attribution lets you answer “which tenant / which feature is driving spend?” — the question finance and product will both ask.</li>
+      </ul>
+
+      <div class="callout warn">
+        <span class="label">Meter on the provider’s counts, not your estimate</span>
+        <p>Your admission-time token estimate is for <em>reserving</em> rate-limit budget. Your <em>bill</em> must use the authoritative counts the provider returns on completion, because the model may stop early (hit a stop sequence), get cut off, or use cached tokens at a discount. Billing the estimate over- or under-charges customers and erodes trust.</p>
+      </div>
+
+      <h2>Prompt caching layer</h2>
+      <p>Most prompts have a large <strong>stable prefix</strong> — a long system prompt, a tool schema, a fixed knowledge document — followed by a small <strong>dynamic tail</strong> (the user’s latest turn). Re-processing the identical prefix on every call wastes time and money. Prompt caching lets the provider reuse the computed state (the KV cache) for a prefix it has seen before, so it only does fresh work on the new tail.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Imagine reading a 50-page briefing aloud before answering each question. Prompt caching means: read the briefing once, keep it open on the desk, and for every later question just read the new question and answer. You skip 50 pages of re-reading each time. (This ties straight back to the inference page: the “briefing” is the KV cache for the prefix.)</p>
+      </div>
+
+      <ul>
+        <li><strong>Cache key.</strong> Hash the stable prefix together with the tenant and the model (the cached state is model-specific). Mark the prefix/dynamic boundary explicitly so you cache the longest shared span.</li>
+        <li><strong>What to cache.</strong> Long, reused, identical-across-calls content: system prompts, tool definitions, few-shot examples, a shared document. Don’t bother caching short or highly variable text — the bookkeeping outweighs the win.</li>
+        <li><strong>Invalidation.</strong> Caches are time-bounded (entries expire after an idle window) and content-addressed (change one token in the prefix and the hash changes, so it’s naturally a miss). Bump a version in the key when the system prompt changes so stale prefixes fall out cleanly.</li>
+        <li><strong>The win.</strong> A cache <em>hit</em> on the prefix means far fewer tokens are processed at full price and time-to-first-token drops sharply, because the expensive prefill over the prefix is skipped.</li>
+      </ul>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Prompt caching: latency & cost on a long-prefix request"
+        data-sub="A request with a large stable prefix (e.g. long system prompt + shared doc) and a short user turn. Lower is better."
+        data-groups='["Time to first token (ms)","Billed prefix cost (relative)"]'
+        data-series='[
+          {"name":"No cache","color":"#f0986b","values":[900,100]},
+          {"name":"Cache hit on prefix","color":"#5fd38a","values":[270,12]}
+        ]'
+        data-cap="Illustrative. On a cache hit the provider skips re-prefilling the stable prefix, so time-to-first-token falls dramatically and the prefix tokens are billed at a steep discount. The win grows with how large and how reused the prefix is."></div>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha: putting volatile data in the cached prefix</span>
+        <p>If you stuff a timestamp, a request ID, or per-user data at the <em>top</em> of the prompt, the prefix changes every call and you never get a cache hit. Order matters: put the truly stable content first (system prompt, tools, shared docs), and the volatile, per-request content last. Cache the head, vary the tail.</p>
+      </div>
+
+      <h2>Model routing &amp; fallback</h2>
+      <p>Not every request needs your most powerful model. <strong>Routing</strong> sends each request to the cheapest model that can do the job; <strong>fallback</strong> keeps the platform up when a model or provider fails.</p>
+      <ul>
+        <li><strong>Route by task.</strong> Classification, extraction, short replies → a fast, cheap model (e.g. Haiku-tier). Hard reasoning, long synthesis → a strong model (e.g. Opus-tier). The routing decision can be static (per endpoint), tier-based (per tenant plan), or learned (a small classifier picks).</li>
+        <li><strong>Fail over on errors.</strong> If the primary returns a 5xx or times out, retry on a fallback (another region, another provider, or a comparable model) — but within a <em>budget</em> so you don’t stack retries forever.</li>
+        <li><strong>Timeouts &amp; retry budgets.</strong> Give each attempt a per-attempt timeout and cap total attempts (e.g. 2) and total wall-clock. Use exponential backoff with jitter. A retry without a budget turns a provider blip into a self-inflicted outage (a retry storm).</li>
+      </ul>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Routing: cost of a 1,000-request workload by model mix"
+        data-sub="Same workload, different routing policy. Most requests are simple; a few are hard. Lower total cost is better."
+        data-groups='["All on strong model","Routed: cheap default, strong on hard"]'
+        data-series='[
+          {"name":"Relative spend","color":"#c099f0","values":[100,34]}
+        ]'
+        data-cap="Illustrative. Sending everything to the strong model is simple but expensive. Routing the easy majority to a cheap model and reserving the strong model for the hard minority cuts spend sharply with little quality loss — the core economic argument for a routing layer."></div>
+
+      <div class="callout warn">
+        <span class="label">Retries need idempotency</span>
+        <p>If you retry a request that may have already partially succeeded, you risk doing the work (and billing) twice. Pair retries with an <strong>idempotency key</strong> so a duplicate is recognised and de-duplicated rather than re-executed. More on this under reliability below.</p>
+      </div>
+
+      <h2>Queueing &amp; backpressure for spiky load</h2>
+      <p>LLM traffic is bursty and inference is slow and expensive, so demand routinely exceeds the throughput your provider quota allows. You have three honest options when that happens, and a real platform uses all three:</p>
+      <ul>
+        <li><strong>Shed</strong> — reject over-limit requests immediately with 429 + <code>Retry-After</code>. Best for interactive, latency-sensitive calls where a stale answer is useless.</li>
+        <li><strong>Queue</strong> — admit the request to a bounded queue and process it when capacity frees up. Best for async/batch work (a nightly summarisation job) where completion matters more than instant response. Make the queue <em>bounded</em> so it provides backpressure instead of growing without limit.</li>
+        <li><strong>Stream</strong> — for interactive requests, stream tokens as they’re generated so the user sees progress immediately, which keeps perceived latency low even when the full response is slow.</li>
+      </ul>
+      <p>The unifying principle is <strong>admission control</strong>: decide at the front door whether to serve now, serve later, or refuse — never accept unbounded work you can’t finish. Async APIs (submit a job, poll or get a webhook for the result) are how you expose the “serve later” path cleanly to clients.</p>
+
+      <h2>Observability</h2>
+      <p>You cannot operate a platform you can’t see. Three pillars, plus the LLM-specific dimensions:</p>
+      <table>
+        <thead><tr><th>Pillar</th><th>Answers</th><th>For an LLM platform, include…</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Logs</strong></td><td>What happened on this one request?</td><td>tenant_id, model, status, token counts, cache hit/miss, latency — never the raw prompt/response unless privacy-cleared.</td></tr>
+          <tr><td><strong>Traces</strong></td><td>Where did the time go across stages?</td><td>spans for auth → limit → cache → provider call, so you can see whether latency is yours or the provider’s.</td></tr>
+          <tr><td><strong>Metrics</strong></td><td>How is the system behaving in aggregate?</td><td>latency <strong>p50 / p99</strong>, error rate, RPM/TPM, tokens, cost, cache hit rate — sliced <strong>per tenant</strong>.</td></tr>
+        </tbody>
+      </table>
+      <p>Watch <strong>p99, not just the average</strong> — averages hide the slow tail that customers actually feel. Per-tenant dashboards let you answer “is the platform slow, or is this one customer hammering a 200k-token prefix?” and back the SLOs you promise.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha: logging raw prompts and responses</span>
+        <p>Prompts and completions often contain customer PII or secrets. Logging them verbatim turns your observability store into a compliance liability and a breach blast-radius. Log <em>metadata</em> (token counts, latency, status, hashes) by default; gate raw content behind explicit consent, redaction, and short retention.</p>
+      </div>
+
+      <h2>Reliability</h2>
+      <p>The platform sits in front of a slow, occasionally-failing dependency (the model provider). Reliability is mostly about <em>containing</em> that failure so it doesn’t become your failure.</p>
+      <ul>
+        <li><strong>Timeouts everywhere.</strong> Every outbound call has a deadline. A request with no timeout is a thread (and a customer) hung forever.</li>
+        <li><strong>Retries with budgets + backoff.</strong> Retry transient errors, but cap attempts and total time, and use exponential backoff with jitter to avoid synchronised retry storms.</li>
+        <li><strong>Idempotency keys.</strong> The client sends a unique key per logical request; the gateway de-duplicates so a network retry doesn’t double-execute or double-bill. Essential for any non-read operation.</li>
+        <li><strong>Circuit breakers.</strong> When a provider is clearly down, stop hammering it — trip the breaker, fail fast to the fallback, and probe periodically. This protects both you and the recovering provider.</li>
+        <li><strong>Graceful degradation.</strong> When the strong model is unavailable, fall back to a weaker one and say so, rather than returning a hard error. A slightly worse answer beats no answer for most product surfaces.</li>
+      </ul>
+
+      <div class="callout key">
+        <span class="label">The whole platform in one sentence</span>
+        <p>A stateless gateway authenticates the caller, resolves the tenant, checks request- and token-based limits against shared counters, looks up a tenant-scoped prompt cache, routes to the cheapest capable model with timeouts and a fallback, streams tokens back, meters the real token usage to a durable ledger, and emits per-tenant logs/traces/metrics — so the product is fast, fair, cheap, observable, and survives a provider going down.</p>
+      </div>
+
+      <h2>How this shows up in the interview</h2>
+
+      <h3>Q1 · “Design the LLM API platform.”</h3>
+      <p>Start with the spine, then layer concerns onto the gateway. <em>“Client to a stateless gateway to model providers, with tokens streaming back. The gateway is the choke point that owns the cross-cutting work, and shared state lives beside it.”</em> Then walk the request path in order: <strong>auth → tenant resolution → rate limit (req + tokens) → prompt-cache lookup → model routing with timeout/fallback → admission/queue → stream → meter usage</strong>. Call out the two stores: a fast in-memory store for counters and cache, a durable log/warehouse for usage. Close with cross-cutting concerns: observability (p50/p99, error rate, cost, per tenant) and reliability (timeouts, retries-with-budget, idempotency, graceful degradation). The structure itself is the answer — interviewers want to see you put rejections cheap-and-early and metering accurate-and-late.</p>
+
+      <h3>Q2 · “How do you rate-limit a multi-tenant platform by tokens?”</h3>
+      <p>Two ceilings, per tenant, in shared state. <em>“I limit both RPM and TPM, because LLM load scales with tokens, not requests.”</em> Use a <strong>token bucket per tenant</strong> (burst-tolerant, cheap state) stored in Redis so every stateless gateway sees the same count. Because output tokens aren’t known up front, <strong>estimate</strong> cost at admission (known input + <code>max_tokens</code> bound), <strong>reserve</strong> the budget, then <strong>reconcile</strong> against the provider’s real counts on completion. Over-limit → <strong>429 with Retry-After</strong> (explicit backpressure). Per-tenant buckets give fairness; add a global ceiling to protect the upstream provider from the sum of all tenants. Mention the trap: limiting RPM alone lets one big-context tenant blow the budget while “under the limit.”</p>
+
+      <h3>Q3 · “Design the prompt-caching layer.”</h3>
+      <p>Separate the stable prefix from the dynamic tail and cache the prefix. <em>“Most prompts are a big fixed head — system prompt, tools, shared docs — plus a small per-request tail. I cache the head.”</em> Cache key = <code>hash(tenant_id + model + prefix + version)</code> — tenant- and model-scoped so nothing leaks across customers and the cached KV state matches the model. Invalidation is time-based (idle expiry) and content-addressed (any prefix change misses), with a version bump when the system prompt changes. Be explicit about the win (skip the prefix prefill → lower TTFT and discounted prefix tokens, tying back to the KV cache from the inference module) and the gotcha (volatile data at the top of the prompt kills the hit rate — keep stable content first). If pushed, note you can layer an exact-match <em>response</em> cache for identical full requests, but only within a tenant.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Why limit by tokens as well as by requests? Isn’t requests-per-minute enough?</summary>
+        <div class="answer">
+          <p>No — for an LLM platform, load and cost scale with <strong>tokens</strong>, not request count. A single request with a 200k-token context can cost and load the system more than a thousand tiny requests. If you only cap RPM, one tenant sending huge-context calls can exhaust your provider budget and wreck latency for everyone while technically staying under the request limit. So you enforce both RPM and TPM (often splitting input vs output tokens), estimating cost at admission and reconciling against the provider’s real counts afterward.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>A teammate proposes caching prompts with the key <code>hash(prompt)</code>, shared across all tenants. What’s wrong?</summary>
+        <div class="answer">
+          <p>It breaks tenant isolation. Two tenants who send the same prefix would share a cache entry, which at minimum is a timing side-channel (one can detect the other’s usage) and at worst leaks one tenant’s cached <em>response</em> to another. The cache key must include the tenant (and the model, since cached KV state is model-specific): <code>hash(tenant_id + model + prefix + version)</code>. Cross-tenant sharing should only happen for deliberately public, audited content — never as the default.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Your platform retries failed provider calls. A customer complains they were billed twice for one action. What did you miss?</summary>
+        <div class="answer">
+          <p>Idempotency. A retry of a request that already partially or fully succeeded re-executed the work and re-metered it. The fix: the client supplies an <strong>idempotency key</strong> per logical request, and the gateway de-duplicates — returning the original result (and the original usage record) instead of running and billing it again. Pair this with bounded retry budgets and backoff-with-jitter so retries don’t become a storm, and a circuit breaker so you fail fast when the provider is clearly down.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

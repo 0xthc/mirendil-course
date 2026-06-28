@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1 · Inference, latency &amp; cost</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P1</div>
+      <h1>Inference, latency &amp; cost</h1>
+      <p class="lede">When a product feels slow or a bill feels scary, the cause is almost always one of a few mechanical facts about how a model turns a prompt into tokens. Learn these and you can diagnose latency, predict cost, and pick the right model on sight — the single clearest signal that you actually understand the thing you are building on.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Asking a model a question is like asking someone to read your whole letter and then handwrite a reply. <strong>Reading</strong> the letter is fast — they can skim the whole page at once. <strong>Writing</strong> the reply is slow — one word at a time, and every new word means re-reading everything written so far. The reading phase is <em>prefill</em>; the writing phase is <em>decode</em>. Almost all the waiting is the writing, and you pay the most for the words the model writes back.</p>
+      </div>
+
+      <h2>The two phases: prefill and decode</h2>
+      <p>Every request runs in two distinct phases with completely different performance characters. Confusing them is the root of most wrong intuitions about speed and cost.</p>
+
+      <table>
+        <thead><tr><th></th><th>PREFILL (read the prompt)</th><th>DECODE (write the answer)</th></tr></thead>
+        <tbody>
+          <tr><td><strong>What happens</strong></td><td>The whole prompt is processed in one shot.</td><td>Output tokens are generated one at a time, each depending on the last.</td></tr>
+          <tr><td><strong>Parallelism</strong></td><td>All prompt tokens at once — highly parallel.</td><td>Strictly sequential — token N needs token N-1.</td></tr>
+          <tr><td><strong>Bottleneck</strong></td><td><strong>Compute-bound</strong> (the GPUs are busy doing math).</td><td><strong>Memory-bandwidth-bound</strong> (the GPUs wait on reading weights + cache).</td></tr>
+          <tr><td><strong>You feel it as</strong></td><td>Time to first token (TTFT).</td><td>Tokens per second, and total length of the wait.</td></tr>
+        </tbody>
+      </table>
+
+      <p>Here is the part people miss. Prefill is parallel, so a 2,000-token prompt is processed in roughly the same wall-clock time as a 200-token one would need passes — it is one big matrix multiply that keeps the GPU saturated. Decode cannot be parallelized over time: to write the 100th word the model must have already written the 99th. So each output token is its own forward pass through the entire model, and those passes happen back-to-back. <strong>That is why decode dominates latency</strong> — a 500-token answer is 500 sequential trips through the network.</p>
+
+      <div class="callout key">
+        <span class="label">The two big levers</span>
+        <p>Two facts drive nearly every latency-and-cost decision you will make: <strong>(1) output tokens are far more expensive and far slower than input tokens</strong> because each one is a separate sequential forward pass, and <strong>(2) prompt caching</strong> lets you skip re-paying for a stable prefix you have already processed. Shorten outputs and cache prefixes, and you have pulled the two largest levers that exist.</p>
+      </div>
+
+      <h2>Why decode is memory-bound (and prefill is not)</h2>
+      <p>During decode the model generates one token, which is a tiny amount of arithmetic — but to do it the GPU must read <em>every weight in the model</em> out of memory, plus the cache of all previous tokens. The math finishes long before the reading does, so the chip sits idle waiting on memory bandwidth. Prefill, by contrast, reads those same weights once and reuses them across thousands of prompt tokens in parallel, so the math is the bottleneck instead. This is also why <em>batching</em> helps decode so much: if you read the weights once and apply them to many requests at the same time, the expensive memory read is amortized.</p>
+
+      <h2>The KV cache</h2>
+      <p>To predict the next token, the model's attention mechanism needs the keys and values of every previous token. Recomputing those from scratch on every step would make decode quadratically slow. So the model stores them: after a token is processed, its keys and values are kept in the <strong>KV cache</strong>, and each new token only computes its own K/V and attends against the saved ones. That is what makes per-token decode cheap and roughly constant instead of growing with position.</p>
+
+      <div class="diagram">
+        <p>Token 1 → compute K,V → <strong>store in cache</strong><br>
+        Token 2 → compute its K,V → <strong>store</strong> → attend over [1,2]<br>
+        Token 3 → compute its K,V → <strong>store</strong> → attend over [1,2,3]<br>
+        … each step adds one row; nothing is recomputed.</p>
+        <div class="cap">The KV cache trades memory for speed: keys/values for past tokens are saved, so each new token is cheap.</div>
+      </div>
+
+      <p>The catch: the cache <strong>grows linearly with context length</strong>. A long conversation or a big document means a big cache, held in GPU memory for the whole request. That cache is what bounds how many requests can run at once — it competes with other requests for the same finite memory. So context length does not just cost you input tokens; it eats the memory budget that determines throughput. Longer context → bigger cache → fewer concurrent requests → lower throughput and, often, higher latency under load.</p>
+
+      <h2>The request lifecycle, step by step</h2>
+      <p>Step through one streaming request from arrival to completion. Watch where time actually goes.</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="Anatomy of one streamed request"
+        data-sub="Click Next to follow a prompt from arrival to the final token."
+        data-steps='[
+          {"op":"prompt arrives","shape":"1,500 input tokens","note":"The user message plus your system prompt and any context. Nothing has been computed yet."},
+          {"op":"PREFILL — process the whole prompt","shape":"one parallel pass","note":"All 1,500 tokens go through the model together. Compute-bound, fast, and it fills the KV cache for every prompt token."},
+          {"op":"first token emitted","shape":"TTFT","note":"Time to first token: how long until the user sees anything. Dominated by prefill length + queue wait."},
+          {"op":"DECODE — generate token, repeat","shape":"1 token per forward pass","note":"Sequential. Each pass reads all weights + the KV cache, emits one token, appends its K/V, and loops. Memory-bandwidth-bound."},
+          {"op":"stream token to client","shape":"tokens / sec","note":"Each new token is sent as it is produced, so the user reads while the model writes. This hides the total decode time."},
+          {"op":"stop condition","shape":"EOS or max_tokens","note":"The loop ends at an end-of-sequence token or the output cap. The full reply is now complete; the KV cache for this request is freed."}
+        ]'
+        data-cap="The single repeated DECODE step is where most of the wall-clock time lives — one sequential forward pass per output token."></div>
+
+      <h2>Why output tokens cost about 5× input</h2>
+      <p>Look at any frontier model's pricing and output tokens are several times more expensive than input tokens — commonly around <strong>5×</strong>. The lifecycle above explains exactly why. Input tokens are consumed in the parallel, compute-efficient prefill: read once, processed together. Output tokens each require a full sequential forward pass over the whole model, and that pass is memory-bandwidth-bound and cannot be batched across time. You are paying for scarce sequential GPU time, not parallel throughput. The same asymmetry means output tokens dominate <em>latency</em> too: a request that reads 4,000 tokens and writes 50 often feels snappy, while one that reads 200 and writes 2,000 feels slow.</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Input vs output: relative cost and relative latency per token"
+        data-sub="Illustrative, normalized to input = 1. Output tokens cost more AND take far more wall-clock time each."
+        data-groups='["Cost per token","Latency per token"]'
+        data-series='[{"name":"Input (prefill)","color":"#57b6f5","values":[1,1]},{"name":"Output (decode)","color":"#f0986b","values":[5,30]}]'
+        data-cap="Output is roughly 5× the price per token, but its per-token <strong>latency</strong> gap is even larger — each output token is a separate sequential pass, while input tokens are processed in parallel. This is why “make the answer shorter” is often your biggest speed win."></div>
+
+      <h2>Why long prompts are expensive — and how prompt caching helps</h2>
+      <p>A long prompt is expensive in two ways: you pay input-token cost for every token of it on every call, and prefilling it takes real time that lands on TTFT. If your system prompt, tool definitions, and a big chunk of context are the <em>same</em> on every request — which is the common case for an agent or a chat product — you are re-paying to prefill identical text again and again.</p>
+
+      <p><strong>Prompt caching</strong> fixes this. The provider caches the prefill state (the computed KV) of a stable prefix. On the next call with the same prefix, that work is reused instead of recomputed: cached input tokens are dramatically cheaper (often around a tenth of the price) and TTFT drops because most of the prefill is already done. The win is largest exactly where it hurts most — long, stable system prompts and long-context documents reused across many turns.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha</span>
+        <p>Prompt caching only helps a prefix that is <strong>byte-identical and stable</strong>. If you put something that changes every request — a timestamp, the user's name, a freshly retrieved snippet — near the <em>top</em> of your prompt, you invalidate the cache for everything after it and pay full prefill again. Order your prompt cache-friendly: stable content first (system prompt, tools, fixed context), volatile content last. Caches also expire after a short idle window, so a low-traffic feature may rarely get a hit.</p>
+      </div>
+
+      <h2>Throughput vs latency: they are not the same goal</h2>
+      <p>Latency is how fast <em>one</em> request finishes. Throughput is how many tokens the system delivers <em>in total</em> per second across all users. They trade off, and the main dial is <strong>batching</strong>: running many requests together amortizes the expensive weight reads in decode, raising throughput — but a request may wait to join a batch, and a fuller batch can slow each individual decode step, raising latency. A serving system tuned for cost-per-token (big batches) and one tuned for a snappy single user (small batches, low queueing) are configured differently.</p>
+
+      <p>Two latency numbers matter, and you should name both:</p>
+      <ul>
+        <li><strong>Time to first token (TTFT)</strong> — responsiveness; how long until the user sees <em>something</em>. Driven by queue wait + prefill (so by prompt length and caching).</li>
+        <li><strong>Tokens per second (throughput per stream)</strong> — how fast the answer flows once it starts. Driven by model size, batch pressure, and decode efficiency.</li>
+      </ul>
+      <p>And always report <strong>percentiles, not averages</strong>. A p50 (median) of 400 ms with a p99 of 6 s means one user in a hundred is having a terrible time — usually from queueing under load or unusually long outputs. Averages hide exactly the tail that makes users churn.</p>
+
+      <h2>Choosing a model: the cost / latency / quality triangle</h2>
+      <p>You rarely need the biggest model for every call. Match the tier to the job. Using Claude as the running example across three tiers:</p>
+
+      <table>
+        <thead><tr><th>Tier</th><th>Example</th><th>Best for</th><th>Cost / latency</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Small / fast</strong></td><td>Haiku 4.5</td><td>Classification, routing, extraction, simple tool calls, high-volume tasks, sub-tasks inside a larger pipeline.</td><td>Cheapest, lowest latency.</td></tr>
+          <tr><td><strong>Mid / balanced</strong></td><td>Sonnet 4.6</td><td>The everyday workhorse: most chat, drafting, summarization, solid reasoning and coding at good speed.</td><td>Moderate.</td></tr>
+          <tr><td><strong>Large / most capable</strong></td><td>Opus 4.8</td><td>Hard reasoning, complex multi-step agents, tricky code, anything where a wrong answer is costly.</td><td>Highest cost &amp; latency.</td></tr>
+        </tbody>
+      </table>
+
+      <p>The senior move is to <strong>route by difficulty</strong>: send the easy 80% of traffic to a small model and escalate only the hard cases to a large one. A classifier that decides which tier to use can cut cost and latency dramatically while keeping quality where it counts. Pair that with caching and tight output limits and you have the three biggest knobs working together.</p>
+
+      <h2>Try it: the inference cost &amp; latency calculator</h2>
+      <p>Move the sliders. Notice how output tokens move the needle far more than input tokens, how the larger tiers cost and lag more, and how flipping prompt caching on collapses the cost of a long, stable prompt.</p>
+
+      <div class="viz" data-viz="costcalc"
+        data-title="Estimate cost &amp; latency for one request"
+        data-sub="Drag the token sliders, switch model tiers, and toggle prompt caching. Watch output tokens dominate."></div>
+
+      <h2>How this shows up in the interview</h2>
+      <p>This topic is a favorite because it instantly separates people who have shipped on models from people who have only called an API. Expect questions like these.</p>
+
+      <div class="callout key">
+        <span class="label">Q: Why is long context slow and expensive?</span>
+        <p>Two mechanisms. <strong>Cost:</strong> every input token is billed and must be prefilled; long prompts mean more prefill work and a larger KV cache held for the whole request. <strong>Latency:</strong> a long prompt lengthens prefill, which is most of TTFT, and the large KV cache consumes GPU memory that would otherwise allow more batching — so throughput drops and tail latency rises under load. The fix toolbox: prompt caching for stable prefixes, retrieval to send only relevant context instead of everything, and trimming history.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">Q: Users say the agent feels slow. How do you diagnose it?</span>
+        <p>Separate the two clocks first. <strong>Is TTFT high or is tokens/sec low?</strong> If TTFT is high, the prompt is too long or uncached, or requests are queueing — shorten/cache the prefix, check load. If tokens/sec is low or the answer is just long, the output is the problem — cap <code>max_tokens</code>, instruct for brevity, or drop to a smaller/faster model. Then check the agent shape: are tool calls serial when they could run in parallel? Is every call hitting the largest model when a small one would do? Always look at <strong>p99, not the average</strong>, and confirm streaming is on so the user sees tokens immediately. Concretely: enable prompt caching, shorten outputs, parallelize tool calls, route easy steps to a smaller model.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">Q: Pick a model for feature X.</span>
+        <p>State the tradeoff out loud: cost vs latency vs quality, driven by volume and how costly a wrong answer is. A high-volume classifier or router → small/fast tier (Haiku 4.5). A user-facing chat or drafting assistant → balanced tier (Sonnet 4.6). A complex coding agent or a high-stakes reasoning step → most-capable tier (Opus 4.8). Then add the kicker: start on a mid tier, measure quality with evals, and only move up if quality demands it or down if cost does — and consider routing by difficulty rather than picking one tier for everything.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>A request reads a 4,000-token document and writes a 40-token summary. Another reads a 100-token question and writes a 1,500-token essay. Which is slower and more expensive, and why?</summary>
+        <div class="answer">
+          <p>The essay request — by a lot. Output tokens are generated one at a time, each a separate sequential forward pass, so 1,500 output tokens means 1,500 sequential trips through the model; that dominates both latency and (at ~5× the price) cost. The document's 4,000 input tokens are processed in one parallel, compute-efficient prefill and are billed at the cheaper input rate. Reading is cheap and fast; writing is expensive and slow.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>What is the KV cache, and why does a longer context reduce how many requests you can serve at once?</summary>
+        <div class="answer">
+          <p>The KV cache stores the keys and values of all previously processed tokens so each new decode step only computes its own K/V and attends over the saved ones — that is what makes per-token decode cheap. But the cache grows linearly with context length and lives in GPU memory for the whole request. More context per request means a bigger cache per request, leaving less memory to hold other requests' caches — so fewer requests fit in a batch, throughput falls, and tail latency rises under load.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>You add prompt caching to your agent but see almost no improvement. What likely went wrong?</summary>
+        <div class="answer">
+          <p>The cacheable prefix probably is not actually stable. If something volatile — a timestamp, the user's name, a freshly retrieved snippet — sits near the top of the prompt, it invalidates the cache for everything after it, so each call re-prefills from there. Reorder so stable content (system prompt, tool definitions, fixed context) comes first and volatile content last. Also check traffic: caches expire after a short idle window, so a low-traffic feature may rarely get a cache hit.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

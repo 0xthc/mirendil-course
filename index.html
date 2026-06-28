@@ -11,18 +11,19 @@
   <main class="content">
     <div class="content-inner">
       <div class="hero">
-        <div class="eyebrow">Mirendil AI Lab · concept course</div>
-        <h1>Tensor-Sequence Parallelism,<br>explained for software engineers</h1>
-        <p class="lede">You're a full-stack engineer, not a data scientist. This course rebuilds every idea in the mirendil test from the ground up — slowly, concretely, and shape-first — until TP, SP, and TSP feel obvious.</p>
+        <div class="eyebrow">AI engineering · concept course</div>
+        <h1>AI engineering,<br>explained for software engineers</h1>
+        <p class="lede">You're a full-stack engineer, not a data scientist. Two tracks, built from the ground up — slowly, concretely, with live diagrams: how models are <strong>trained across GPUs</strong>, and how you <strong>build products</strong> on top of them. Plus an interview-prep layer for product-engineering roles.</p>
       </div>
 
       <div class="callout key">
-        <span class="label">What this course is about</span>
-        <p>The test is a <strong>reproduction study</strong> of a research paper on <strong>Tensor-Sequence Parallelism (TSP)</strong>. The goal: run a transformer's attention and MLP across <strong>8 GPUs</strong> so that no single GPU runs out of memory, and measure whether the clever combined strategy (TSP) really beats the simpler ones (TP, SP).</p>
-        <p>Every module ends with <em>check-your-understanding</em> toggles. There's an interactive <strong>shape calculator</strong> in modules 5–7 so you can play with the tensor shapes yourself.</p>
+        <span class="label">What's here</span>
+        <p><strong>Track 1 — Parallelism &amp; training:</strong> how a transformer computes, and how TP / SP / TSP split it across 8 GPUs so nothing runs out of memory. <strong>Track 2 — Building with models:</strong> inference cost, prompting, tool calling, agents, RAG, evals, safety, and product system design. <strong>Interview prep:</strong> a question bank, system-design walkthroughs, and coding exercises.</p>
+        <p>Every page has an <em>ELI5</em>, interactive widgets, and <em>check-your-understanding</em> toggles. The <strong>runnable notebooks</strong> let you execute and tinker with each idea.</p>
       </div>
 
-      <h2 style="border:none">The path</h2>
+      <h2 style="border:none">Track 1 · Parallelism &amp; training</h2>
+      <p class="lede" style="font-size:17px">How models are <em>trained/run</em> across GPUs — the systems side. This is the flavor of the take-home test.</p>
       <div class="module-cards">
         <a class="module-card" href="01-big-picture.html">
           <span class="mnum">MODULE 01</span>
@@ -76,7 +77,67 @@
         </a>
       </div>
 
-      <h2 style="border:none;margin-top:48px">Runnable notebooks</h2>
+      <h2 style="margin-top:48px">Track 2 · Building with models</h2>
+      <p class="lede" style="font-size:17px">How you <em>build products</em> on top of models — the product-engineering side. This is the day job of a Member of Technical Staff, Product Engineering.</p>
+      <div class="module-cards">
+        <a class="module-card" href="p1-inference.html">
+          <span class="mnum">P1</span>
+          <div class="mttl">Inference, latency & cost</div>
+          <p class="mdesc">Prefill vs decode, the KV cache, why output tokens & long context drive cost and latency, and prompt caching. With a live cost calculator.</p>
+        </a>
+        <a class="module-card" href="p2-talking-to-models.html">
+          <span class="mnum">P2</span>
+          <div class="mttl">Talking to models in production</div>
+          <p class="mdesc">Structured outputs, tool/function calling, streaming + cancellation, retries and determinism — the everyday API mechanics.</p>
+        </a>
+        <a class="module-card" href="p3-agents.html">
+          <span class="mnum">P3</span>
+          <div class="mttl">Agents</div>
+          <p class="mdesc">The agent loop, tool registries, loop guards & cost caps, failure handling, and observability — making agents reliable.</p>
+        </a>
+        <a class="module-card" href="p4-rag.html">
+          <span class="mnum">P4</span>
+          <div class="mttl">RAG & context management</div>
+          <p class="mdesc">Retrieval, chunking, reranking, citations, and what to do when the context window fills up.</p>
+        </a>
+        <a class="module-card" href="p5-evals.html">
+          <span class="mnum">P5</span>
+          <div class="mttl">Evals & telemetry</div>
+          <p class="mdesc">Offline eval sets, LLM-as-judge, A/B testing, and regression gates — how to know a change actually helped.</p>
+        </a>
+        <a class="module-card" href="p6-safety.html">
+          <span class="mnum">P6</span>
+          <div class="mttl">Safety in product</div>
+          <p class="mdesc">Prompt injection (direct & indirect), tool scoping, moderation, abuse & rate-limiting — defense in depth.</p>
+        </a>
+        <a class="module-card" href="p7-system-design.html">
+          <span class="mnum">P7</span>
+          <div class="mttl">Product system design</div>
+          <p class="mdesc">The building blocks: API gateway, rate limiting, usage metering, prompt-cache layer, model routing & fallback, observability.</p>
+        </a>
+      </div>
+
+      <h2 style="margin-top:48px">Interview prep</h2>
+      <p class="lede" style="font-size:17px">Turn the two tracks into offers: what they ask, how to design out loud, and code you can write under pressure.</p>
+      <div class="module-cards">
+        <a class="module-card" href="iv-questions.html">
+          <span class="mnum">PREP</span>
+          <div class="mttl">Question bank</div>
+          <p class="mdesc">35+ real questions across coding, system design, LLM judgment, product sense, fundamentals, and behavioral — each with "what they're probing" and a strong answer.</p>
+        </a>
+        <a class="module-card" href="iv-system-design.html">
+          <span class="mnum">PREP</span>
+          <div class="mttl">System-design walkthroughs</div>
+          <p class="mdesc">A reusable method plus four worked designs: prompt cache, RAG, agent platform, multi-tenant rate limiter.</p>
+        </a>
+        <a class="module-card" href="iv-coding.html">
+          <span class="mnum">PREP</span>
+          <div class="mttl">Coding exercises</div>
+          <p class="mdesc">Six LLM-flavored exercises with full solutions: streaming chat, agent loop, structured-output retry, rate limiter, eval runner, prompt-cache LRU.</p>
+        </a>
+      </div>
+
+      <h2 style="margin-top:48px">Runnable notebooks</h2>
       <p class="lede" style="font-size:17px">The companion <strong>marimo notebooks</strong> — execute every idea, with live charts and correctness checks. These are rendered snapshots (all charts &amp; outputs visible); for the live sliders, run them locally with <code>uv run marimo edit notebooks/…</code>.</p>
       <div class="module-cards">
         <a class="module-card" href="notebooks/01_transformers.html">
@@ -104,11 +165,31 @@
           <div class="mttl">Tensor-sequence parallelism, simulated</div>
           <p class="mdesc">The folded loop algorithm, verified correct, plus the real benchmark memory/latency charts.</p>
         </a>
+        <a class="module-card" href="notebooks/06_agent_loop.html">
+          <span class="mnum">NOTEBOOK 06</span>
+          <div class="mttl">Build an agent loop</div>
+          <p class="mdesc">A real observe→act→repeat loop over a mock model + tool registry, with loop guards, failure handling, and cost charts.</p>
+        </a>
+        <a class="module-card" href="notebooks/07_structured_outputs.html">
+          <span class="mnum">NOTEBOOK 07</span>
+          <div class="mttl">Structured outputs + retry</div>
+          <p class="mdesc">Force reliable JSON: schema validation and corrective retries, with a success-rate-vs-retries chart.</p>
+        </a>
+        <a class="module-card" href="notebooks/08_eval_harness.html">
+          <span class="mnum">NOTEBOOK 08</span>
+          <div class="mttl">An eval harness</div>
+          <p class="mdesc">Dataset + LLM-as-judge + a regression gate that catches v2 getting worse on one case. With comparison charts.</p>
+        </a>
+        <a class="module-card" href="notebooks/09_latency_cost.html">
+          <span class="mnum">NOTEBOOK 09</span>
+          <div class="mttl">Latency & cost model</div>
+          <p class="mdesc">The math of inference cost: output tokens vs input, prefill vs decode, prompt caching — with interactive sliders.</p>
+        </a>
       </div>
 
       <div class="callout analogy" style="margin-top:32px">
         <span class="label">How to use this</span>
-        <p>Read in order — each module assumes the previous one. When a module references a file like <code>tensor_parallelism.py</code>, that's real code sitting next to this course in the repo; open it side by side once you've read the concept. You don't need a GPU to follow along. The notebooks above let you actually run and tinker with each concept (multi-GPU is simulated on CPU).</p>
+        <p>Track 1 builds in order (each module assumes the last). Track 2 modules are more standalone — jump to what you need. If you're prepping for a product-engineering role, skim Track 2, then drill the interview-prep pages. You don't need a GPU: the parallelism notebooks simulate multi-GPU on CPU, and the product notebooks use a mock model so everything runs offline.</p>
       </div>
     </div>
   </main>

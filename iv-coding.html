@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interview · Coding exercises</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Interview prep</div>
+      <h1>Coding exercises</h1>
+      <p class="lede">Six realistic, LLM-flavored coding rounds for a product-engineering loop. Each one is the kind of small-but-real system you actually ship around a model: streaming, agent loops, validation, rate limits, evals, and caching. Try each before opening the solution — the interviewer is watching how you think, not just whether it compiles.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>An LLM coding round is less like a puzzle and more like a tiny on-the-job task: “here is a model, here is a half-real problem, wire it up like you would in production.” The model is a black box that streams text, sometimes returns junk, and sometimes errors. Your job is to be the calm, careful plumbing around it — handle the happy path in five minutes, then spend the rest of the time on what happens when things go wrong.</p>
+      </div>
+
+      <h2>How coding rounds run at an AI lab</h2>
+      <p>Product-engineering rounds at AI labs are deliberately practical. You get a real-ish task, a shared editor or your own machine, and 45–60 minutes. The model call is usually stubbed or behind a thin client so you are not graded on prompt-wrangling — you are graded on the <strong>engineering around the model</strong>: streaming, cancellation, retries, validation, backpressure, caching, observability.</p>
+      <p>Three habits separate strong candidates:</p>
+      <ul>
+        <li><strong>Talk as you go.</strong> Narrate assumptions and trade-offs. Silence reads as “stuck,” even when you are thinking clearly.</li>
+        <li><strong>Get the happy path working fast, then attack failure.</strong> A working skeleton in ten minutes buys you the credibility to spend thirty on edge cases — which is where the points are.</li>
+        <li><strong>Name the production concerns out loud</strong> even if you do not implement all of them: timeouts, cancellation, idempotency, metrics, cost.</li>
+      </ul>
+
+      <div class="callout key">
+        <span class="label">What they are actually grading</span>
+        <p>They are grading <strong>judgment and failure handling</strong>, not “did it pass the one test.” Anyone can call a model and print the result. The signal is: do you cancel cleanly on disconnect, cap your retries, validate untrusted output, and degrade gracefully when the model misbehaves? Treat the model as an unreliable network dependency that occasionally lies, and you will out-perform people writing cleverer algorithms.</p>
+      </div>
+
+      <div class="callout gotcha">
+        <span class="label">The #1 way people lose the round</span>
+        <p>Ignoring the failure paths. The model returns malformed JSON and your parser throws and crashes the request. The client disconnects and your server keeps generating (and billing) tokens into the void. Your retry loop has no cap and hammers a rate-limited API forever. Write the happy path, then immediately ask yourself “what breaks?” — out loud.</p>
+      </div>
+
+      <p>Below, each exercise shows the problem, clarifying questions, hints, and a full worked solution behind a toggle. Open the toggle only after you have sketched your own approach.</p>
+
+      <h2>The shape of every solution</h2>
+      <p>Most of these follow the same arc: a request comes in, you do some work against the model, and you have to handle cancellation, errors, or retries along the way. Here is that lifecycle as a stepper — keep it in your head as you read each problem.</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="The LLM request lifecycle most exercises live inside"
+        data-sub="Where judgment shows up: the dashed branches"
+        data-steps='[{"op":"Request in","shape":"validate + auth","note":"Parse input, check the API key / rate limit before doing any expensive work. Cheap rejects first."},{"op":"Call the model","shape":"stream or await","note":"Stream tokens for chat UIs; await for structured tasks. Attach an abort signal so the call is cancellable."},{"op":"Failure branch","shape":"retry / abort / give up","note":"Malformed output, schema failure, timeout, or client disconnect. This branch is where most of the grade lives."},{"op":"Validate output","shape":"schema + bounds","note":"Never trust model output. Parse, validate against a schema, clamp ranges before using it."},{"op":"Respond + clean up","shape":"flush, then release","note":"Send the result, then release resources: close streams, decrement in-flight counters, record metrics and cost."}]'
+        data-cap="The dashed failure branch is the part interviewers probe hardest. A solution that only walks the straight line scores as junior."></div>
+
+      <h2>Exercise 1 — Streaming chat endpoint with cancellation</h2>
+      <p><strong>Problem.</strong> Build an HTTP endpoint that streams a model’s tokens to the client as they arrive (Server-Sent Events). If the client disconnects or aborts mid-stream, you must stop generating immediately and clean up — no orphaned model calls, no leaked resources.</p>
+
+      <h3>Clarifying questions / constraints</h3>
+      <ul>
+        <li>Transport — SSE, chunked HTTP, or WebSocket? (Assume SSE; it is the common default for chat.)</li>
+        <li>How does the model client expose streaming — async iterator with an abort signal? (Assume yes; that is the modern shape.)</li>
+        <li>Do we need to persist the partial completion on disconnect, or just discard? (Assume discard for now, but mention persistence.)</li>
+        <li>What should the client see on error mid-stream — an SSE <code>error</code> event then close? (Yes.)</li>
+      </ul>
+
+      <h3>Hints</h3>
+      <ul>
+        <li>Wire the request’s abort/close signal straight into the model call’s <code>AbortController</code>.</li>
+        <li>Use a <code>try/finally</code> so cleanup runs whether the stream finished, errored, or was cancelled.</li>
+        <li>Send a final sentinel event (<code>[DONE]</code>) so the client knows the stream ended cleanly vs. dropped.</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Show full solution + what interviewers look for</summary>
+        <div class="answer">
+          <p>TypeScript / Node (works with the Web <code>Response</code> streaming API used by modern runtimes). The model call is a clearly-marked fake that yields tokens.</p>
+          <pre><code><span class="tok-com">// --- FAKE model client (replace with real SDK, e.g. Anthropic streaming) ---</span>
+<span class="tok-com">// Real usage: client.messages.stream({ model: "claude-sonnet-4-6", ... })</span>
+<span class="tok-key">async function</span>* <span class="tok-fn">fakeModelStream</span>(
+  prompt: <span class="tok-key">string</span>,
+  signal: AbortSignal,
+): AsyncGenerator&lt;<span class="tok-key">string</span>&gt; {
+  <span class="tok-key">const</span> tokens = (<span class="tok-str">"Thinking about: "</span> + prompt).split(<span class="tok-str">" "</span>);
+  <span class="tok-key">for</span> (<span class="tok-key">const</span> t <span class="tok-key">of</span> tokens) {
+    <span class="tok-key">if</span> (signal.aborted) <span class="tok-key">throw new</span> DOMException(<span class="tok-str">"aborted"</span>, <span class="tok-str">"AbortError"</span>);
+    <span class="tok-key">await new</span> Promise((r) =&gt; setTimeout(r, <span class="tok-num">40</span>)); <span class="tok-com">// simulate token latency</span>
+    yield t + <span class="tok-str">" "</span>;
+  }
+}
+
+<span class="tok-com">// --- The endpoint: returns a streaming Response ---</span>
+<span class="tok-key">export async function</span> <span class="tok-fn">handleChat</span>(req: Request): Promise&lt;Response&gt; {
+  <span class="tok-key">const</span> { prompt } = <span class="tok-key">await</span> req.json();
+  <span class="tok-key">if</span> (<span class="tok-key">typeof</span> prompt !== <span class="tok-str">"string"</span> || !prompt.trim()) {
+    <span class="tok-key">return new</span> Response(<span class="tok-str">"prompt required"</span>, { status: <span class="tok-num">400</span> });
+  }
+
+  <span class="tok-com">// Bridge the client disconnect -&gt; model abort.</span>
+  <span class="tok-key">const</span> ac = <span class="tok-key">new</span> AbortController();
+  req.signal.addEventListener(<span class="tok-str">"abort"</span>, () =&gt; ac.abort());
+
+  <span class="tok-key">const</span> encoder = <span class="tok-key">new</span> TextEncoder();
+  <span class="tok-key">const</span> stream = <span class="tok-key">new</span> ReadableStream({
+    <span class="tok-key">async</span> start(controller) {
+      <span class="tok-key">const</span> send = (event: <span class="tok-key">string</span>, data: <span class="tok-key">string</span>) =&gt;
+        controller.enqueue(encoder.encode(<span class="tok-str">`event: ${event}\ndata: ${data}\n\n`</span>));
+      <span class="tok-key">try</span> {
+        <span class="tok-key">for await</span> (<span class="tok-key">const</span> token <span class="tok-key">of</span> fakeModelStream(prompt, ac.signal)) {
+          send(<span class="tok-str">"token"</span>, JSON.stringify({ text: token }));
+        }
+        send(<span class="tok-str">"done"</span>, <span class="tok-str">"[DONE]"</span>);
+      } <span class="tok-key">catch</span> (err) {
+        <span class="tok-key">if</span> ((err <span class="tok-key">as</span> Error)?.name === <span class="tok-str">"AbortError"</span>) {
+          <span class="tok-com">// Expected on disconnect — do NOT treat as a server error.</span>
+          <span class="tok-key">return</span>;
+        }
+        send(<span class="tok-str">"error"</span>, JSON.stringify({ message: <span class="tok-str">"generation failed"</span> }));
+      } <span class="tok-key">finally</span> {
+        ac.abort(); <span class="tok-com">// stop the model if we exited any other way</span>
+        <span class="tok-key">try</span> { controller.close(); } <span class="tok-key">catch</span> {}
+      }
+    },
+    cancel() {
+      ac.abort(); <span class="tok-com">// reader went away (client closed the tab)</span>
+    },
+  });
+
+  <span class="tok-key">return new</span> Response(stream, {
+    headers: {
+      <span class="tok-str">"Content-Type"</span>: <span class="tok-str">"text/event-stream"</span>,
+      <span class="tok-str">"Cache-Control"</span>: <span class="tok-str">"no-cache, no-transform"</span>,
+      <span class="tok-str">"Connection"</span>: <span class="tok-str">"keep-alive"</span>,
+    },
+  });
+}</code></pre>
+          <p><strong>What interviewers look for.</strong></p>
+          <ul>
+            <li><strong>Cancellation actually propagates.</strong> The single most important line is bridging <code>req.signal</code> into the model’s <code>AbortController</code>, plus the <code>cancel()</code> hook on the stream. Without it the model keeps generating (and billing) after the client leaves.</li>
+            <li><strong>AbortError is not an error.</strong> Distinguishing an expected abort from a real failure shows production experience — logging aborts as 500s is a classic false alarm.</li>
+            <li><strong><code>finally</code> for cleanup.</strong> Resources released on every exit path: completion, error, or cancel.</li>
+            <li><strong>Protocol clarity.</strong> A <code>done</code> sentinel and a distinct <code>error</code> event let the client tell “finished” from “dropped.” Bonus points for mentioning heartbeats to keep proxies from killing idle connections, and persisting the partial on disconnect if the product needs resumability.</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2>Exercise 2 — Tool-calling agent loop</h2>
+      <p><strong>Problem.</strong> The model can request tool calls. Implement the loop: send the conversation, if the model returns tool calls, dispatch each to a registry of tools, feed the results back, and repeat until the model returns a final text answer. Guard against infinite loops with a max-steps cap, and handle a tool that throws.</p>
+
+      <h3>Clarifying questions / constraints</h3>
+      <ul>
+        <li>Can the model request multiple tools in one turn? (Assume yes — dispatch them, ideally in parallel.)</li>
+        <li>On tool error, do we abort or feed the error back to the model? (Feed it back as a tool result so the model can recover or apologize.)</li>
+        <li>What is the max-steps behavior — error, or return best-effort? (Stop and return a graceful message.)</li>
+        <li>Are tools trusted? Validate tool arguments before executing? (Yes — model-chosen args are untrusted input.)</li>
+      </ul>
+
+      <h3>Hints</h3>
+      <ul>
+        <li>Model the loop as: append assistant turn → if tool calls, run them → append tool results → loop.</li>
+        <li>A tool registry is just <code>Map&lt;name, (args) =&gt; Promise&lt;result&gt;&gt;</code> plus arg validation.</li>
+        <li>Wrap each tool call so a throw becomes a structured error result, not a crash.</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Show full solution + what interviewers look for</summary>
+        <div class="answer">
+          <p>Python, async. The model client is a fake that scripts a tool call then a final answer.</p>
+          <pre><code><span class="tok-key">import</span> asyncio, json
+<span class="tok-key">from</span> dataclasses <span class="tok-key">import</span> dataclass
+<span class="tok-key">from</span> typing <span class="tok-key">import</span> Any, Awaitable, Callable
+
+<span class="tok-com"># --- Tool registry -------------------------------------------------</span>
+<span class="tok-key">@dataclass</span>
+<span class="tok-key">class</span> <span class="tok-fn">Tool</span>:
+    name: <span class="tok-key">str</span>
+    run: Callable[[<span class="tok-key">dict</span>], Awaitable[Any]]
+    validate: Callable[[<span class="tok-key">dict</span>], <span class="tok-key">None</span>]  <span class="tok-com"># raises ValueError on bad args</span>
+
+<span class="tok-key">async def</span> <span class="tok-fn">get_weather</span>(args: <span class="tok-key">dict</span>) -&gt; <span class="tok-key">dict</span>:
+    <span class="tok-key">return</span> {<span class="tok-str">"city"</span>: args[<span class="tok-str">"city"</span>], <span class="tok-str">"temp_c"</span>: <span class="tok-num">21</span>}
+
+<span class="tok-key">def</span> <span class="tok-fn">_validate_weather</span>(args: <span class="tok-key">dict</span>) -&gt; <span class="tok-key">None</span>:
+    <span class="tok-key">if not</span> <span class="tok-fn">isinstance</span>(args.get(<span class="tok-str">"city"</span>), <span class="tok-key">str</span>) <span class="tok-key">or not</span> args[<span class="tok-str">"city"</span>]:
+        <span class="tok-key">raise</span> ValueError(<span class="tok-str">"city must be a non-empty string"</span>)
+
+REGISTRY = {<span class="tok-str">"get_weather"</span>: Tool(<span class="tok-str">"get_weather"</span>, get_weather, _validate_weather)}
+
+<span class="tok-com"># --- FAKE model: turn 1 asks for a tool, turn 2 answers -----------</span>
+<span class="tok-com"># Real usage: await client.messages.create(model="claude-opus-4-8", tools=[...])</span>
+<span class="tok-key">async def</span> <span class="tok-fn">fake_model</span>(messages: <span class="tok-key">list</span>) -&gt; <span class="tok-key">dict</span>:
+    <span class="tok-key">if not</span> <span class="tok-fn">any</span>(m[<span class="tok-str">"role"</span>] == <span class="tok-str">"tool"</span> <span class="tok-key">for</span> m <span class="tok-key">in</span> messages):
+        <span class="tok-key">return</span> {<span class="tok-str">"type"</span>: <span class="tok-str">"tool_calls"</span>,
+                <span class="tok-str">"calls"</span>: [{<span class="tok-str">"id"</span>: <span class="tok-str">"c1"</span>, <span class="tok-str">"name"</span>: <span class="tok-str">"get_weather"</span>,
+                           <span class="tok-str">"args"</span>: {<span class="tok-str">"city"</span>: <span class="tok-str">"Paris"</span>}}]}
+    <span class="tok-key">return</span> {<span class="tok-str">"type"</span>: <span class="tok-str">"text"</span>, <span class="tok-str">"text"</span>: <span class="tok-str">"It is 21C in Paris."</span>}
+
+<span class="tok-com"># --- The agent loop ----------------------------------------------</span>
+<span class="tok-key">async def</span> <span class="tok-fn">dispatch</span>(call: <span class="tok-key">dict</span>) -&gt; <span class="tok-key">dict</span>:
+    tool = REGISTRY.get(call[<span class="tok-str">"name"</span>])
+    <span class="tok-key">if</span> tool <span class="tok-key">is None</span>:
+        <span class="tok-key">return</span> {<span class="tok-str">"tool_call_id"</span>: call[<span class="tok-str">"id"</span>], <span class="tok-str">"error"</span>: <span class="tok-str">"unknown tool"</span>}
+    <span class="tok-key">try</span>:
+        tool.validate(call[<span class="tok-str">"args"</span>])
+        result = <span class="tok-key">await</span> tool.run(call[<span class="tok-str">"args"</span>])
+        <span class="tok-key">return</span> {<span class="tok-str">"tool_call_id"</span>: call[<span class="tok-str">"id"</span>], <span class="tok-str">"result"</span>: result}
+    <span class="tok-key">except</span> Exception <span class="tok-key">as</span> e:  <span class="tok-com"># feed the error back, do not crash the loop</span>
+        <span class="tok-key">return</span> {<span class="tok-str">"tool_call_id"</span>: call[<span class="tok-str">"id"</span>], <span class="tok-str">"error"</span>: <span class="tok-fn">str</span>(e)}
+
+<span class="tok-key">async def</span> <span class="tok-fn">run_agent</span>(user_msg: <span class="tok-key">str</span>, max_steps: <span class="tok-key">int</span> = <span class="tok-num">6</span>) -&gt; <span class="tok-key">str</span>:
+    messages = [{<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: user_msg}]
+    <span class="tok-key">for</span> step <span class="tok-key">in</span> <span class="tok-fn">range</span>(max_steps):
+        reply = <span class="tok-key">await</span> fake_model(messages)
+        <span class="tok-key">if</span> reply[<span class="tok-str">"type"</span>] == <span class="tok-str">"text"</span>:
+            <span class="tok-key">return</span> reply[<span class="tok-str">"text"</span>]
+        <span class="tok-com"># record the assistant's tool request, then run the tools</span>
+        messages.append({<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"tool_calls"</span>: reply[<span class="tok-str">"calls"</span>]})
+        results = <span class="tok-key">await</span> asyncio.gather(*(dispatch(c) <span class="tok-key">for</span> c <span class="tok-key">in</span> reply[<span class="tok-str">"calls"</span>]))
+        <span class="tok-key">for</span> r <span class="tok-key">in</span> results:
+            messages.append({<span class="tok-str">"role"</span>: <span class="tok-str">"tool"</span>, <span class="tok-str">"content"</span>: json.dumps(r)})
+    <span class="tok-key">return</span> <span class="tok-str">"Stopped: hit max steps without a final answer."</span>  <span class="tok-com"># graceful cap</span></code></pre>
+          <p><strong>What interviewers look for.</strong></p>
+          <ul>
+            <li><strong>The loop terminates.</strong> A <code>max_steps</code> cap is non-negotiable — a model can loop forever requesting tools. Returning a graceful message beats raising.</li>
+            <li><strong>Tool errors feed back, not up.</strong> Catching the exception and returning it as a tool result lets the model recover. Crashing the whole request on one bad tool call is the junior move.</li>
+            <li><strong>Untrusted arguments.</strong> Validating <code>args</code> before executing — the model picked those values, treat them like user input. Unknown tool names handled too.</li>
+            <li><strong>Parallel dispatch.</strong> <code>asyncio.gather</code> for multiple calls in one turn shows you think about latency. Mention idempotency and per-tool timeouts as next steps.</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2>Exercise 3 — Structured output: parse, validate, retry</h2>
+      <p><strong>Problem.</strong> You ask the model for JSON matching a schema. The response may be malformed JSON, or valid JSON that fails the schema. Parse it; on failure, send a corrective message back to the model and retry, up to N times. If it still fails, give up gracefully with a clear error.</p>
+
+      <h3>Clarifying questions / constraints</h3>
+      <ul>
+        <li>What is the schema and how strict? (Assume a small typed schema; reject extra/missing fields.)</li>
+        <li>Does the model wrap JSON in prose or code fences? (Often yes — extract before parsing.)</li>
+        <li>How many retries, and do we change temperature on retry? (N=3; lower temperature and quote the exact error.)</li>
+        <li>What does “give up gracefully” mean — exception or a typed failure result? (Typed result the caller can branch on.)</li>
+      </ul>
+
+      <h3>Hints</h3>
+      <ul>
+        <li>Separate the two failure modes: <em>parse</em> error vs. <em>validation</em> error. The corrective message differs.</li>
+        <li>Feed the actual error text back to the model — specific feedback fixes things faster than “try again.”</li>
+        <li>Many providers support a forced-JSON / tool-schema mode; mention it, but still validate.</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Show full solution + what interviewers look for</summary>
+        <div class="answer">
+          <p>Python with a small hand-rolled validator (so it is self-contained; in production use <code>pydantic</code>). The model fake returns junk first, then valid JSON.</p>
+          <pre><code><span class="tok-key">import</span> json, re
+<span class="tok-key">from</span> dataclasses <span class="tok-key">import</span> dataclass
+
+<span class="tok-key">@dataclass</span>
+<span class="tok-key">class</span> <span class="tok-fn">Ticket</span>:
+    title: <span class="tok-key">str</span>
+    priority: <span class="tok-key">str</span>   <span class="tok-com"># one of: low, medium, high</span>
+
+<span class="tok-key">def</span> <span class="tok-fn">validate_ticket</span>(obj: <span class="tok-key">dict</span>) -&gt; Ticket:
+    <span class="tok-key">if not</span> <span class="tok-fn">isinstance</span>(obj.get(<span class="tok-str">"title"</span>), <span class="tok-key">str</span>) <span class="tok-key">or not</span> obj[<span class="tok-str">"title"</span>].strip():
+        <span class="tok-key">raise</span> ValueError(<span class="tok-str">"field 'title' must be a non-empty string"</span>)
+    <span class="tok-key">if</span> obj.get(<span class="tok-str">"priority"</span>) <span class="tok-key">not in</span> {<span class="tok-str">"low"</span>, <span class="tok-str">"medium"</span>, <span class="tok-str">"high"</span>}:
+        <span class="tok-key">raise</span> ValueError(<span class="tok-str">"field 'priority' must be one of low|medium|high"</span>)
+    <span class="tok-key">return</span> Ticket(obj[<span class="tok-str">"title"</span>], obj[<span class="tok-str">"priority"</span>])
+
+<span class="tok-key">def</span> <span class="tok-fn">extract_json</span>(text: <span class="tok-key">str</span>) -&gt; <span class="tok-key">dict</span>:
+    <span class="tok-com"># strip code fences / surrounding prose, then parse</span>
+    fenced = re.search(<span class="tok-str">r"\{.*\}"</span>, text, re.DOTALL)
+    <span class="tok-key">if not</span> fenced:
+        <span class="tok-key">raise</span> ValueError(<span class="tok-str">"no JSON object found in response"</span>)
+    <span class="tok-key">return</span> json.loads(fenced.group(<span class="tok-num">0</span>))  <span class="tok-com"># may raise JSONDecodeError</span>
+
+<span class="tok-com"># --- FAKE model: bad output first, then good ----------------------</span>
+<span class="tok-com"># Real usage: client.messages.create(model="claude-sonnet-4-6", ...)</span>
+_SCRIPT = [
+    <span class="tok-str">"Sure! {title: 'Login broken', priority: 'urgent'}"</span>,  <span class="tok-com"># not valid JSON</span>
+    <span class="tok-str">'{\"title\": \"Login broken\", \"priority\": \"urgent\"}'</span>,    <span class="tok-com"># bad enum</span>
+    <span class="tok-str">'{\"title\": \"Login broken\", \"priority\": \"high\"}'</span>,       <span class="tok-com"># valid</span>
+]
+<span class="tok-key">def</span> <span class="tok-fn">fake_model</span>(messages: <span class="tok-key">list</span>) -&gt; <span class="tok-key">str</span>:
+    <span class="tok-key">return</span> _SCRIPT[<span class="tok-fn">min</span>(<span class="tok-fn">len</span>([m <span class="tok-key">for</span> m <span class="tok-key">in</span> messages <span class="tok-key">if</span> m[<span class="tok-str">"role"</span>] == <span class="tok-str">"user"</span>]) - <span class="tok-num">1</span>, <span class="tok-num">2</span>)]
+
+<span class="tok-key">def</span> <span class="tok-fn">get_ticket</span>(prompt: <span class="tok-key">str</span>, max_retries: <span class="tok-key">int</span> = <span class="tok-num">3</span>):
+    messages = [{<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>: prompt}]
+    last_err = <span class="tok-key">None</span>
+    <span class="tok-key">for</span> attempt <span class="tok-key">in</span> <span class="tok-fn">range</span>(max_retries):
+        raw = fake_model(messages)
+        <span class="tok-key">try</span>:
+            <span class="tok-key">return</span> validate_ticket(extract_json(raw))  <span class="tok-com"># success</span>
+        <span class="tok-key">except</span> (ValueError, json.JSONDecodeError) <span class="tok-key">as</span> e:
+            last_err = <span class="tok-fn">str</span>(e)
+            <span class="tok-com"># corrective turn: quote the EXACT error so the model can fix it</span>
+            messages.append({<span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: raw})
+            messages.append({<span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>, <span class="tok-str">"content"</span>:
+                <span class="tok-str">f"That response was invalid: {last_err}. "</span>
+                <span class="tok-str">"Reply with ONLY valid JSON: "</span>
+                <span class="tok-str">'{\"title\": string, \"priority\": \"low\"|\"medium\"|\"high\"}'</span>})
+    <span class="tok-key">return</span> {<span class="tok-str">"ok"</span>: <span class="tok-key">False</span>, <span class="tok-str">"error"</span>: <span class="tok-key">f</span><span class="tok-str">"gave up after {max_retries} tries: {last_err}"</span>}</code></pre>
+          <p><strong>What interviewers look for.</strong></p>
+          <ul>
+            <li><strong>Two distinct failure modes.</strong> Parse failure and schema failure are different; both are caught and both produce a useful corrective message.</li>
+            <li><strong>Specific corrective feedback.</strong> Echoing the exact error text (“priority must be one of…”) is what makes the retry converge. Vague “try again” wastes attempts.</li>
+            <li><strong>Bounded retries + graceful give-up.</strong> Returns a typed failure the caller can handle instead of throwing into the void or looping forever.</li>
+            <li><strong>Robust extraction.</strong> Handling prose/fences around the JSON shows real-world experience. Bonus: mention native structured-output / tool-schema modes and validating even then, plus lowering temperature on retry.</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2>Exercise 4 — Token-bucket rate limiter</h2>
+      <p><strong>Problem.</strong> Implement a per-API-key rate limiter using the token-bucket algorithm. Each key gets a bucket that refills over time. <code>allow(key)</code> returns whether the request proceeds and, if not, a <code>retry_after</code> in seconds. It must be safe under concurrency.</p>
+
+      <h3>Clarifying questions / constraints</h3>
+      <ul>
+        <li>Token bucket (allows bursts) or fixed window? (Token bucket — smooth + burst-tolerant, the standard for APIs.)</li>
+        <li>Single process or distributed across servers? (Assume single process; mention Redis for distributed.)</li>
+        <li>Per-key rate and burst capacity configurable? (Yes — rate and capacity as params.)</li>
+        <li>Lazy refill on access, or a background timer? (Lazy — compute elapsed time on each call; no timer to leak.)</li>
+      </ul>
+
+      <h3>Hints</h3>
+      <ul>
+        <li>Store per key: current token count and last-refill timestamp. Refill = elapsed × rate, capped at capacity.</li>
+        <li>Refill lazily on each <code>allow</code> call — no background thread needed.</li>
+        <li><code>retry_after</code> = how long until one token is available = <code>(1 - tokens) / rate</code>.</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Show full solution + what interviewers look for</summary>
+        <div class="answer">
+          <p>Python with a lock for thread-safety. The same lazy-refill math works in async by swapping the lock for an <code>asyncio.Lock</code>.</p>
+          <pre><code><span class="tok-key">import</span> time, threading
+<span class="tok-key">from</span> dataclasses <span class="tok-key">import</span> dataclass
+
+<span class="tok-key">@dataclass</span>
+<span class="tok-key">class</span> <span class="tok-fn">Decision</span>:
+    allowed: <span class="tok-key">bool</span>
+    retry_after: <span class="tok-key">float</span> = <span class="tok-num">0.0</span>
+
+<span class="tok-key">class</span> <span class="tok-fn">TokenBucketLimiter</span>:
+    <span class="tok-str">"""Per-key token bucket. rate = tokens/sec, capacity = max burst."""</span>
+    <span class="tok-key">def</span> <span class="tok-fn">__init__</span>(self, rate: <span class="tok-key">float</span>, capacity: <span class="tok-key">int</span>):
+        self.rate = rate
+        self.capacity = capacity
+        self._buckets: <span class="tok-key">dict</span>[<span class="tok-key">str</span>, <span class="tok-key">tuple</span>[<span class="tok-key">float</span>, <span class="tok-key">float</span>]] = {}  <span class="tok-com"># key -&gt; (tokens, last_ts)</span>
+        self._lock = threading.Lock()
+
+    <span class="tok-key">def</span> <span class="tok-fn">allow</span>(self, key: <span class="tok-key">str</span>, cost: <span class="tok-key">float</span> = <span class="tok-num">1.0</span>) -&gt; Decision:
+        now = time.monotonic()  <span class="tok-com"># monotonic: immune to clock changes</span>
+        <span class="tok-key">with</span> self._lock:  <span class="tok-com"># whole read-modify-write is atomic</span>
+            tokens, last = self._buckets.get(key, (self.capacity, now))
+            <span class="tok-com"># lazy refill for the elapsed interval, capped at capacity</span>
+            tokens = <span class="tok-fn">min</span>(self.capacity, tokens + (now - last) * self.rate)
+            <span class="tok-key">if</span> tokens &gt;= cost:
+                self._buckets[key] = (tokens - cost, now)
+                <span class="tok-key">return</span> Decision(allowed=<span class="tok-key">True</span>)
+            <span class="tok-com"># not enough: persist the refilled state, compute wait</span>
+            self._buckets[key] = (tokens, now)
+            retry_after = (cost - tokens) / self.rate
+            <span class="tok-key">return</span> Decision(allowed=<span class="tok-key">False</span>, retry_after=retry_after)
+
+<span class="tok-com"># --- usage ---</span>
+<span class="tok-com"># limiter = TokenBucketLimiter(rate=5.0, capacity=10)  # 5/s, burst of 10</span>
+<span class="tok-com"># d = limiter.allow("key-abc")</span>
+<span class="tok-com"># if not d.allowed: respond_429(retry_after=d.retry_after)</span></code></pre>
+          <p><strong>What interviewers look for.</strong></p>
+          <ul>
+            <li><strong>The refill math is correct.</strong> <code>tokens + elapsed × rate</code>, clamped to capacity, computed lazily. No background timer means nothing to leak or schedule.</li>
+            <li><strong>Concurrency safety.</strong> The entire read-modify-write is inside the lock. A common bug is refilling outside the lock, which double-counts under contention.</li>
+            <li><strong><code>monotonic()</code> not <code>time()</code>.</strong> Wall-clock can jump (NTP, DST) and corrupt the elapsed calculation. Using a monotonic clock is a strong senior signal.</li>
+            <li><strong>Useful <code>retry_after</code>.</strong> Telling the caller exactly when to come back (for a <code>429</code> + <code>Retry-After</code> header) is the product-minded touch. Bonus: mention Redis/Lua for the distributed case and per-key bucket eviction to bound memory.</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2>Exercise 5 — A small eval runner</h2>
+      <p><strong>Problem.</strong> Given a dataset of <code>{input, expected}</code> cases, a model function, and a scorer, run every case, compute the pass rate, and print a short report. Then support comparing two model variants (e.g. two prompts or two models) side by side.</p>
+
+      <h3>Clarifying questions / constraints</h3>
+      <ul>
+        <li>Is the scorer exact-match or fuzzy/graded? (Make it pluggable — scorer returns a 0–1 score.)</li>
+        <li>Run cases concurrently with a concurrency cap? (Yes — models are I/O bound; cap to respect rate limits.)</li>
+        <li>Should a case that throws count as a failure or abort the run? (Count as a 0, never abort — one bad case must not sink the suite.)</li>
+        <li>For the comparison, do we want per-case deltas or just aggregate? (Aggregate pass rate + count of regressions.)</li>
+      </ul>
+
+      <h3>Hints</h3>
+      <ul>
+        <li>Keep three pieces independent: the dataset, the model fn, the scorer. That is what makes it reusable.</li>
+        <li>Wrap each case so an exception becomes a score of 0 with the error recorded.</li>
+        <li>For A/B, run both variants over the same dataset and diff the pass rates.</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Show full solution + what interviewers look for</summary>
+        <div class="answer">
+          <p>Python, async, with a concurrency semaphore. Model fns and scorer are plain callables, so this drops onto any real setup.</p>
+          <pre><code><span class="tok-key">import</span> asyncio
+<span class="tok-key">from</span> dataclasses <span class="tok-key">import</span> dataclass
+<span class="tok-key">from</span> typing <span class="tok-key">import</span> Awaitable, Callable
+
+@dataclass
+<span class="tok-key">class</span> <span class="tok-fn">Case</span>:
+    input: <span class="tok-key">str</span>
+    expected: <span class="tok-key">str</span>
+
+@dataclass
+<span class="tok-key">class</span> <span class="tok-fn">Result</span>:
+    score: <span class="tok-key">float</span>
+    error: <span class="tok-key">str</span> | <span class="tok-key">None</span> = <span class="tok-key">None</span>
+
+ModelFn = Callable[[<span class="tok-key">str</span>], Awaitable[<span class="tok-key">str</span>]]
+Scorer  = Callable[[<span class="tok-key">str</span>, <span class="tok-key">str</span>], <span class="tok-key">float</span>]  <span class="tok-com"># (got, expected) -&gt; 0..1</span>
+
+<span class="tok-key">async def</span> <span class="tok-fn">run_eval</span>(dataset: <span class="tok-key">list</span>[Case], model: ModelFn, scorer: Scorer,
+                   concurrency: <span class="tok-key">int</span> = <span class="tok-num">8</span>) -&gt; <span class="tok-key">list</span>[Result]:
+    sem = asyncio.Semaphore(concurrency)  <span class="tok-com"># respect rate limits</span>
+    <span class="tok-key">async def</span> <span class="tok-fn">one</span>(c: Case) -&gt; Result:
+        <span class="tok-key">async with</span> sem:
+            <span class="tok-key">try</span>:
+                got = <span class="tok-key">await</span> model(c.input)
+                <span class="tok-key">return</span> Result(score=scorer(got, c.expected))
+            <span class="tok-key">except</span> Exception <span class="tok-key">as</span> e:  <span class="tok-com"># a broken case scores 0, never aborts the run</span>
+                <span class="tok-key">return</span> Result(score=<span class="tok-num">0.0</span>, error=<span class="tok-fn">str</span>(e))
+    <span class="tok-key">return await</span> asyncio.gather(*(one(c) <span class="tok-key">for</span> c <span class="tok-key">in</span> dataset))
+
+<span class="tok-key">def</span> <span class="tok-fn">report</span>(name: <span class="tok-key">str</span>, results: <span class="tok-key">list</span>[Result], threshold: <span class="tok-key">float</span> = <span class="tok-num">1.0</span>) -&gt; <span class="tok-key">float</span>:
+    n = <span class="tok-fn">len</span>(results)
+    passed = <span class="tok-fn">sum</span>(<span class="tok-num">1</span> <span class="tok-key">for</span> r <span class="tok-key">in</span> results <span class="tok-key">if</span> r.score &gt;= threshold)
+    errors = <span class="tok-fn">sum</span>(<span class="tok-num">1</span> <span class="tok-key">for</span> r <span class="tok-key">in</span> results <span class="tok-key">if</span> r.error)
+    rate = passed / n <span class="tok-key">if</span> n <span class="tok-key">else</span> <span class="tok-num">0.0</span>
+    <span class="tok-fn">print</span>(<span class="tok-key">f</span><span class="tok-str">"{name:&lt;12} pass {passed}/{n} ({rate:.0%})  errors={errors}"</span>)
+    <span class="tok-key">return</span> rate
+
+<span class="tok-key">async def</span> <span class="tok-fn">compare</span>(dataset, scorer, variant_a, variant_b):
+    a = report(<span class="tok-str">"A: opus-4.8"</span>,   <span class="tok-key">await</span> run_eval(dataset, variant_a, scorer))
+    b = report(<span class="tok-str">"B: sonnet-4.6"</span>, <span class="tok-key">await</span> run_eval(dataset, variant_b, scorer))
+    delta = b - a
+    verdict = <span class="tok-str">"B wins"</span> <span class="tok-key">if</span> delta &gt; <span class="tok-num">0</span> <span class="tok-key">else</span> <span class="tok-str">"A wins"</span> <span class="tok-key">if</span> delta &lt; <span class="tok-num">0</span> <span class="tok-key">else</span> <span class="tok-str">"tie"</span>
+    <span class="tok-fn">print</span>(<span class="tok-key">f</span><span class="tok-str">"delta {delta:+.0%} -&gt; {verdict}"</span>)</code></pre>
+          <p><strong>What interviewers look for.</strong></p>
+          <ul>
+            <li><strong>Clean separation of concerns.</strong> Dataset, model fn, and scorer are independent inputs. That is what makes the runner reusable across tasks — the core insight of an eval harness.</li>
+            <li><strong>One bad case cannot sink the suite.</strong> Per-case <code>try/except</code> turning an exception into a 0 (with the error recorded) is exactly the robustness they probe.</li>
+            <li><strong>Bounded concurrency.</strong> The semaphore shows you know model calls are I/O bound and rate-limited — naive <code>gather</code> over thousands of cases would get throttled.</li>
+            <li><strong>A pluggable scorer + threshold.</strong> A 0–1 score with a pass threshold handles graded evals, not just exact match. The A/B comparison with a delta is the product-facing payoff. Bonus: mention seeds/determinism and saving per-case outputs for inspection.</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2>Exercise 6 — Prompt-cache key + LRU with TTL</h2>
+      <p><strong>Problem.</strong> You want to cache responses for a stable prompt prefix (system prompt + tools + few-shot examples that rarely change). Design the cache key, then implement a small LRU cache with per-entry TTL. Demonstrate a hit and a miss.</p>
+
+      <h3>Clarifying questions / constraints</h3>
+      <ul>
+        <li>What goes into the key? (Everything that changes the output: model id, the full prefix text, and relevant params like temperature.)</li>
+        <li>Is this the provider’s server-side prompt cache, or our own response cache? (Our own response cache — but the key design mirrors prefix-cache thinking.)</li>
+        <li>Eviction policy and size? (LRU with a max size, plus TTL so stale answers expire.)</li>
+        <li>Hash the key or store it raw? (Hash — prefixes are long; a hash keeps keys bounded and avoids logging raw prompts.)</li>
+      </ul>
+
+      <h3>Hints</h3>
+      <ul>
+        <li>Key = stable hash over <code>(model, normalized_prefix, params)</code>. Anything that changes the answer must be in the key.</li>
+        <li>An ordered map gives you O(1) LRU: move-to-end on access, pop-from-front on overflow.</li>
+        <li>TTL: store an expiry timestamp per entry; treat expired entries as a miss and evict them.</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Show full solution + what interviewers look for</summary>
+        <div class="answer">
+          <p>Python using <code>OrderedDict</code> for O(1) LRU. The key builder hashes the model + prefix + params.</p>
+          <pre><code><span class="tok-key">import</span> hashlib, json, time
+<span class="tok-key">from</span> collections <span class="tok-key">import</span> OrderedDict
+<span class="tok-key">from</span> typing <span class="tok-key">import</span> Any
+
+<span class="tok-key">def</span> <span class="tok-fn">cache_key</span>(model: <span class="tok-key">str</span>, prefix: <span class="tok-key">str</span>, params: <span class="tok-key">dict</span>) -&gt; <span class="tok-key">str</span>:
+    <span class="tok-com"># Everything that changes the output goes in the key.</span>
+    <span class="tok-com"># Normalize prefix (strip trailing ws) and sort params for stability.</span>
+    payload = json.dumps(
+        {<span class="tok-str">"model"</span>: model, <span class="tok-str">"prefix"</span>: prefix.strip(), <span class="tok-str">"params"</span>: params},
+        sort_keys=<span class="tok-key">True</span>,
+    )
+    <span class="tok-key">return</span> hashlib.sha256(payload.encode()).hexdigest()  <span class="tok-com"># bounded, log-safe</span>
+
+<span class="tok-key">class</span> <span class="tok-fn">LRUCacheTTL</span>:
+    <span class="tok-key">def</span> <span class="tok-fn">__init__</span>(self, max_size: <span class="tok-key">int</span>, ttl_seconds: <span class="tok-key">float</span>):
+        self.max_size = max_size
+        self.ttl = ttl_seconds
+        self._store: <span class="tok-str">"OrderedDict[str, tuple[Any, float]]"</span> = OrderedDict()
+        self.hits = self.misses = <span class="tok-num">0</span>
+
+    <span class="tok-key">def</span> <span class="tok-fn">get</span>(self, key: <span class="tok-key">str</span>):
+        entry = self._store.get(key)
+        <span class="tok-key">if</span> entry <span class="tok-key">is None</span>:
+            self.misses += <span class="tok-num">1</span>
+            <span class="tok-key">return None</span>
+        value, expires_at = entry
+        <span class="tok-key">if</span> time.monotonic() &gt;= expires_at:        <span class="tok-com"># expired -&gt; miss + evict</span>
+            <span class="tok-key">del</span> self._store[key]
+            self.misses += <span class="tok-num">1</span>
+            <span class="tok-key">return None</span>
+        self._store.move_to_end(key)              <span class="tok-com"># mark most-recently-used</span>
+        self.hits += <span class="tok-num">1</span>
+        <span class="tok-key">return</span> value
+
+    <span class="tok-key">def</span> <span class="tok-fn">put</span>(self, key: <span class="tok-key">str</span>, value: Any):
+        self._store[key] = (value, time.monotonic() + self.ttl)
+        self._store.move_to_end(key)
+        <span class="tok-key">if</span> <span class="tok-fn">len</span>(self._store) &gt; self.max_size:
+            self._store.popitem(last=<span class="tok-key">False</span>)        <span class="tok-com"># evict least-recently-used</span>
+
+<span class="tok-com"># --- demo: one miss (populates), one hit ---</span>
+cache = LRUCacheTTL(max_size=<span class="tok-num">128</span>, ttl_seconds=<span class="tok-num">300</span>)
+SYSTEM = <span class="tok-str">"You are a support triage assistant. ..."</span>  <span class="tok-com"># stable prefix</span>
+k = cache_key(<span class="tok-str">"claude-haiku-4-5"</span>, SYSTEM, {<span class="tok-str">"temperature"</span>: <span class="tok-num">0</span>})
+
+<span class="tok-key">assert</span> cache.get(k) <span class="tok-key">is None</span>          <span class="tok-com"># MISS -&gt; call the model</span>
+cache.put(k, {<span class="tok-str">"answer"</span>: <span class="tok-str">"routed to billing"</span>})
+<span class="tok-key">assert</span> cache.get(k) == {<span class="tok-str">"answer"</span>: <span class="tok-str">"routed to billing"</span>}  <span class="tok-com"># HIT</span>
+<span class="tok-fn">print</span>(<span class="tok-key">f</span><span class="tok-str">"hits={cache.hits} misses={cache.misses}"</span>)  <span class="tok-com"># hits=1 misses=1</span></code></pre>
+          <p><strong>What interviewers look for.</strong></p>
+          <ul>
+            <li><strong>Correct key design.</strong> The key includes <em>everything that changes the answer</em>: model id, the normalized prefix, and params like temperature. Forgetting the model id or temperature is the classic correctness bug — you would serve a Haiku answer for an Opus request.</li>
+            <li><strong>Hashing the key.</strong> Prefixes are huge; a SHA-256 keeps keys bounded and avoids dumping raw prompts into logs/metrics.</li>
+            <li><strong>O(1) LRU + TTL together.</strong> <code>OrderedDict</code> with <code>move_to_end</code>/<code>popitem</code> is the clean idiom; expired entries treated as a miss and evicted on read.</li>
+            <li><strong>Hit/miss accounting.</strong> Tracking hit rate is the observability instinct — you cannot tune a cache you cannot measure. Bonus: connect this to <em>provider</em> prompt caching (put the stable prefix first so the server-side KV cache hits) and discuss invalidation when the system prompt changes.</li>
+          </ul>
+        </div>
+      </details>
+
+      <h2>How this shows up in the interview</h2>
+      <p>Beyond writing the code, expect the interviewer to push on judgment. A few likely questions and crisp answers:</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Where the points are: time spent vs. score weight"
+        data-sub="Roughly how a strong candidate budgets a 50-minute round, and where the grade actually accrues"
+        data-groups='["Happy path","Failure handling","Talking it through","Tests / edge cases"]'
+        data-series='[{"name":"Time spent (%)","color":"#57b6f5","values":[25,40,20,15]},{"name":"Score weight (%)","color":"#5fd38a","values":[15,45,20,20]}]'
+        data-unit="%"
+        data-cap="The happy path is necessary but cheap. Failure handling is where you spend time and earn the grade — invert the usual instinct to polish the happy path."></div>
+
+      <h3>Likely questions</h3>
+      <p><strong>“The model is slow and the client just left — what happens?”</strong> Your abort signal propagates into the model call and you stop generating; cleanup runs in <code>finally</code>; you stop billing tokens. If you did not wire cancellation, say so and fix it — they are checking whether you noticed.</p>
+      <p><strong>“The model returns garbage 1% of the time. How do you keep the product up?”</strong> Validate everything coming out of the model; retry with specific corrective feedback up to a small cap; then degrade gracefully (typed failure, fallback message, or a cheaper deterministic path) rather than throwing into the user’s face.</p>
+      <p><strong>“This works for one server — how does it change at scale?”</strong> Move shared state (rate-limit buckets, caches) into Redis; make tool calls idempotent; add per-call timeouts and circuit breakers; cap concurrency to respect provider rate limits; and instrument hit rates, latency, and cost.</p>
+      <p><strong>“How would you test this?”</strong> Inject a fake model so you can script malformed output, errors, slow responses, and aborts deterministically. Test the failure branches explicitly — that is the part most likely to break in production.</p>
+
+      <div class="callout warn">
+        <span class="label">Use the real model names</span>
+        <p>If you reference models, use current ones and tier them on purpose: <strong>Opus 4.8</strong> for the hardest reasoning, <strong>Sonnet 4.6</strong> as the balanced default, <strong>Haiku 4.5</strong> for cheap/fast/high-volume paths (classification, routing, cache-friendly calls). Saying “use the small model for the eval’s cheap cases” shows cost awareness.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>In the streaming endpoint, why is catching <code>AbortError</code> separately so important?</summary>
+        <div class="answer">
+          <p>Because a client disconnect is an <em>expected, normal</em> event, not a server fault. If you let the abort fall into your generic error handler, you will emit spurious 500s / error events, pollute your error metrics, and possibly alert on-call for something that is just a user closing a tab. Treating <code>AbortError</code> as a clean exit (and still running cleanup in <code>finally</code>) is the correct, production-minded behavior.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Your structured-output retry loop sometimes never converges. What are two likely causes and fixes?</summary>
+        <div class="answer">
+          <p>(1) <strong>Vague corrective messages.</strong> If you just say “that was wrong, try again,” the model has no signal to fix the specific defect. Echo the exact validation error and restate the schema. (2) <strong>Too much randomness.</strong> Retrying at the same high temperature reproduces the same class of mistake; lower the temperature on retry. Always keep a hard retry cap and a graceful give-up so a stubborn case cannot loop forever or run up cost.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why use <code>time.monotonic()</code> instead of <code>time.time()</code> in both the rate limiter and the cache?</summary>
+        <div class="answer">
+          <p>Both rely on measuring <em>elapsed</em> time, and the wall clock can jump backward or forward (NTP corrections, daylight-saving, manual changes). A backward jump could make the rate limiter compute negative elapsed time (refill nothing or break) or make a TTL never expire. <code>monotonic()</code> only ever moves forward at a steady rate, so it is the correct clock for durations. Use <code>time.time()</code> only when you need an actual calendar timestamp.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>What is the single most common reason a prompt-response cache returns a wrong answer?</summary>
+        <div class="answer">
+          <p>An incomplete cache key. If the key omits something that changes the output — the model id, the temperature, a tool definition, or part of the prefix — you will serve a response generated under different conditions. The discipline is: <em>every input that can change the answer must be in the key.</em> When in doubt, hash more, not less; the cost of an over-specific key is a missed hit, while the cost of an under-specific key is a silently wrong answer.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

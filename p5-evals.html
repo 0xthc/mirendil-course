@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P5 · Evals & telemetry</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P5</div>
+      <h1>Evals &amp; telemetry</h1>
+      <p class="lede">An LLM feature can feel great in a demo and still be quietly broken in production. This page is about the discipline that tells you the truth: how to know whether a feature is good, and whether a change actually helped — before you ship it and after.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Imagine you tweak a cookie recipe and ask three friends — they all say it tastes better, so you bake 10,000 for a party. That's how most people "test" a prompt change. The professional way is to keep a fixed tasting panel of 50 cookies you score the same way every time, write down the scores for the old recipe and the new one, and only switch if the new scores are higher. Evals are that fixed tasting panel for LLM features. Telemetry is watching what real party guests actually eat.</p>
+      </div>
+
+      <h2>Why you need evals at all</h2>
+      <p>The same prompt, sent twice, can return different text. Temperature, model updates, a reworded instruction, a new retrieval source — any of these can shift behavior in ways you won't notice by eyeballing a handful of outputs. So the core problem is:</p>
+      <ul>
+        <li><strong>Outputs are non-deterministic.</strong> "It worked when I tried it" is one sample from a distribution. You need many samples to see the distribution.</li>
+        <li><strong>"Looks good on my 3 examples" is not evidence.</strong> Three examples can't catch a regression that hits 8% of inputs. That 8% is still thousands of unhappy users.</li>
+        <li><strong>Every change needs a before/after signal.</strong> Prompt edits and model upgrades both look like improvements in your head. Only a measured comparison tells you which way the needle actually moved — and whether you broke something else while fixing the thing you cared about.</li>
+      </ul>
+
+      <div class="callout key">
+        <span class="label">The whole idea in one line</span>
+        <p>An eval turns "I think this is better" into a <em>number you can compare</em>. Without that number, you are shipping vibes. With it, every prompt and model change becomes a measurable experiment with a pass/fail result.</p>
+      </div>
+
+      <h2>Offline eval sets</h2>
+      <p>An offline eval is a curated dataset you run <em>before</em> shipping — no live users involved. Each item is an input, usually paired with either an expected output or a rubric describing what a good answer looks like. A few flavors you should be able to name:</p>
+      <ul>
+        <li><strong>Golden set</strong> — a small, hand-blessed set of inputs with known-good answers. The cases you would be embarrassed to get wrong. Quality over quantity.</li>
+        <li><strong>Regression set</strong> — every bug you've ever fixed, frozen as a test case. If a future change reintroduces an old failure, this catches it. It only grows.</li>
+        <li><strong>Coverage set</strong> — a broader sample spanning the real input distribution: edge cases, languages, long inputs, adversarial phrasings, the boring 80% too.</li>
+      </ul>
+      <p>The high-leverage move is to <strong>wire the regression set into CI</strong>: a prompt or model change cannot merge unless the eval score clears a threshold. This is the same instinct as unit tests gating a deploy — except the "assertion" is a score over a dataset rather than a single boolean. It's how a serious product team keeps quality from silently drifting down over months of well-intentioned tweaks.</p>
+
+      <div class="callout analogy">
+        <span class="label">Analogy</span>
+        <p>A golden set is your smoke test — small, fast, must always pass. A regression set is your bug-fix test suite — it never forgets a mistake. A coverage set is your integration suite — slower, broader, catches the surprises. Same three layers you already trust in normal software, pointed at a non-deterministic model.</p>
+      </div>
+
+      <h2>How do you score an output?</h2>
+      <p>Building the dataset is half the job; the other half is deciding what counts as correct. Scoring methods sit on a ladder from cheap-and-rigid to expensive-and-flexible:</p>
+      <table>
+        <thead><tr><th>Method</th><th>What it checks</th><th>Good for</th><th>Watch out for</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Exact / structural</strong></td><td>String match, regex, valid JSON, schema conforms, code compiles</td><td>Classification, extraction, structured outputs, tool-call args</td><td>Too strict for open-ended text — a correct paraphrase fails</td></tr>
+          <tr><td><strong>Rubric scoring</strong></td><td>Points against explicit criteria (cites a source? answers the question? stays on policy?)</td><td>Multi-dimensional quality on free text</td><td>Needs a clear rubric or scores get noisy</td></tr>
+          <tr><td><strong>LLM-as-judge</strong></td><td>A strong model grades the output (score or A/B preference) against instructions</td><td>Open-ended quality at scale, where humans are too slow</td><td>The judge has biases and needs its own validation (see below)</td></tr>
+          <tr><td><strong>Human review</strong></td><td>A person reads and rates</td><td>The gold standard; calibrating the other methods</td><td>Slow and expensive — use to validate cheaper graders, not for every run</td></tr>
+        </tbody>
+      </table>
+      <p>The practical pattern: use the cheapest method that captures what you care about. Structural checks for anything machine-verifiable (always prefer these — they're free and unambiguous), rubric or LLM-judge for the squishy stuff, and a thin layer of human review to keep the automated graders honest.</p>
+
+      <h3>LLM-as-judge, and why to distrust it</h3>
+      <p>Using a capable model (say Opus 4.8) to grade another model's output is powerful: it scales open-ended judgment to thousands of cases for the price of a few API calls. But a judge is itself an LLM feature, so it has failure modes you must actively defend against:</p>
+      <ul>
+        <li><strong>Position bias</strong> — in A/B comparisons, judges often favor whichever answer is shown first. Fix: run both orderings and average, or randomize.</li>
+        <li><strong>Verbosity / style bias</strong> — judges tend to reward longer, more confident, more nicely formatted answers even when they're not more correct.</li>
+        <li><strong>Self-preference</strong> — a judge may prefer outputs from its own model family.</li>
+        <li><strong>It needs its own eval.</strong> Before trusting a judge, measure its agreement with human labels on a sample. If the judge agrees with humans only 60% of the time, its scores are barely better than noise.</li>
+      </ul>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha</span>
+        <p>The most common self-inflicted wound: <strong>trusting an LLM judge you never validated.</strong> Teams wire up a judge, watch the score go up, and ship — without ever checking that the judge's grades correlate with what humans (or users) actually consider better. An unvalidated judge can confidently rank a regression as an improvement. Always calibrate the judge against human labels first, and re-check it when you change the judge model.</p>
+      </div>
+
+      <h2>The eval pipeline</h2>
+      <p>Put the pieces together and you get a loop you run on every candidate change. Step through it:</p>
+      <div class="viz" data-viz="flow"
+        data-title="The offline eval pipeline"
+        data-sub="Run this for every prompt edit and model upgrade — ideally in CI."
+        data-steps='[
+          {"op":"Curate dataset","shape":"inputs + expected / rubric","note":"Golden + regression + coverage cases. Each item is an input, paired with an expected output or a rubric. This is the fixed yardstick — change it rarely and deliberately."},
+          {"op":"Run candidate","shape":"candidate prompt or model","note":"Send every dataset input through the version you want to evaluate (new prompt, new model tier, new retrieval source). Capture each raw output."},
+          {"op":"Score each output","shape":"structural · rubric · LLM-judge","note":"Apply the scorer that fits the task. Machine-checkable parts get exact/structural checks; open-ended quality gets a rubric or a validated LLM-judge."},
+          {"op":"Aggregate","shape":"accuracy · helpfulness · format-valid","note":"Roll per-item scores into per-metric numbers across the whole set. Now you have one comparable scorecard per candidate."},
+          {"op":"Compare vs baseline","shape":"candidate − baseline","note":"Diff the candidate scorecard against the current production version. Look for any metric that dropped, not just the one you tried to improve."},
+          {"op":"Gate","shape":"pass → ship · fail → block","note":"If every metric clears its threshold, the change can ship. If any regresses, the gate blocks the merge. This is the CI assertion for non-deterministic systems."}
+        ]'
+        data-cap="The loop is the product. <strong>Dataset → run → score → aggregate → compare → gate.</strong> Everything else is detail."></div>
+
+      <h2>Catching a regression: a worked comparison</h2>
+      <p>Say you rewrite a prompt to make answers friendlier. Demos look warmer, the team loves it, you're ready to ship. Then you run the eval set and compare against the current production prompt:</p>
+      <div class="viz" data-viz="barchart"
+        data-title="Candidate prompt vs current — across eval metrics"
+        data-sub="Helpfulness went up. But run the full scorecard before you celebrate."
+        data-groups='["Accuracy","Helpfulness","Format-valid","Policy-safe"]'
+        data-series='[{"name":"Current (v1)","color":"#57b6f5","values":[91,74,98,99]},{"name":"Candidate (v2)","color":"#f0986b","values":[78,86,82,97]}]'
+        data-unit="%"
+        data-ymax="100"
+        data-cap="The friendlier prompt (orange) wins on <strong>helpfulness</strong> (+12) — exactly what you were optimizing. But <strong>accuracy fell 13 points</strong> and <strong>format-valid fell 16</strong>: the chattier style buries facts and breaks the JSON the downstream code parses. A single-metric view would have shipped a regression. The full scorecard catches it, and the gate blocks the merge."></div>
+      <p>This is the entire argument for evals in one chart. The change did what you asked — and quietly broke two things you didn't think to look at. The discipline isn't "measure the metric you care about"; it's <strong>measure the whole scorecard, and treat any unexplained drop as a regression until proven otherwise.</strong></p>
+
+      <h2>Telemetry: measuring in production</h2>
+      <p>Offline evals tell you about a fixed dataset. Real users do things your dataset never imagined, so you also instrument the live product. The signals worth collecting, roughly from weak to strong:</p>
+      <ul>
+        <li><strong>Explicit feedback</strong> — thumbs up/down, star ratings. Easy to collect but sparse and biased (angry users vote more than happy ones).</li>
+        <li><strong>Implicit behavior</strong> — acceptance rate (did they keep the suggestion?), edit rate (how much did they change it?), retry/regenerate rate, copy actions. Far more honest than stars because it's what people <em>did</em>, not what they said.</li>
+        <li><strong>Task success</strong> — did the user actually accomplish their goal? The thing you ultimately care about, and the hardest to measure. Often proxied (did the support ticket close? did the code get committed?).</li>
+        <li><strong>Operational</strong> — latency (p50/p95), error rate, cost per request. A feature that's "smarter" but twice as slow can still lose users.</li>
+      </ul>
+
+      <div class="callout warn">
+        <span class="label">Vanity metrics mislead</span>
+        <p>A metric is vain when it goes up while users get worse. Classics: <em>thumbs-up rate</em> climbs because you only show the button to users who already finished happily; <em>total messages per session</em> rises because the assistant got confusing and people have to re-ask; <em>acceptance rate</em> looks great because the bar for "accepted" is one click and people click to dismiss. Always ask: if this number doubled, would a user actually be better off? Tie metrics to real outcomes (task completed, ticket resolved, time saved), not activity.</p>
+      </div>
+
+      <h2>Building the loop</h2>
+      <p>Offline evals and production telemetry aren't two separate things — they feed each other. Production surfaces failures you didn't anticipate; those failures become new eval cases; the eval set gates the next change; telemetry confirms the change helped real users. That cycle is the engine of a feature that improves over time instead of decaying.</p>
+      <div class="diagram">
+        <p><strong>offline evals</strong> → gate the deploy → <strong>ship</strong> → <strong>telemetry</strong> catches real-world failures → mine failures into <strong>new eval cases</strong> → back to offline evals</p>
+        <div class="cap">The compounding loop: every production surprise becomes a permanent regression test. The eval set is a living record of everything your feature must never get wrong again.</div>
+      </div>
+      <p>This is the same philosophy the rest of this track keeps returning to: <strong>validate small, measure real.</strong> Prove it on a tight, trusted dataset before you ship; then watch what actually happens with real users, and fold what you learn back into the dataset.</p>
+
+      <h2>How this shows up in the interview</h2>
+      <p>Product-engineering interviews probe whether you can tell signal from vibes. Expect questions like these.</p>
+
+      <details class="quiz">
+        <summary>How do you know a prompt change improved the product?</summary>
+        <div class="answer">
+          <p>Not by looking at a few outputs — those are single samples from a non-deterministic distribution. I'd run both the old and new prompt over a fixed eval set and compare a full scorecard (accuracy/structural checks plus rubric or a validated LLM-judge for open-ended quality), looking for regressions on metrics I <em>wasn't</em> targeting, not just the one I was. If the candidate clears every threshold, I ship it behind a flag and confirm with production telemetry — acceptance/edit rate and task success — that real users are better off, not just the offline number. "Improved" means: the scorecard didn't regress and a real-world outcome moved.</p>
+        </div>
+      </details>
+
+      <details class="quiz">
+        <summary>Design an eval harness for an LLM feature.</summary>
+        <div class="answer">
+          <p>Five pieces. (1) <strong>Dataset</strong>: a golden set of must-pass cases, a regression set seeded from every past bug, and a coverage set sampling the real input distribution including edge cases. (2) <strong>Runner</strong>: send every input through the candidate version, capture raw outputs, control temperature for reproducibility. (3) <strong>Scorers</strong>: structural checks for anything machine-verifiable (valid JSON, schema, exact labels), rubric or LLM-judge for open-ended quality — and validate the judge against human labels first. (4) <strong>Aggregation</strong>: roll per-item scores into per-metric numbers, with confidence intervals so I don't over-read noise. (5) <strong>Gate</strong>: wire it into CI so a change can't merge unless every metric clears its threshold. Then close the loop by mining production failures into new dataset cases.</p>
+        </div>
+      </details>
+
+      <details class="quiz">
+        <summary>Which metric tells you it's working — and why do vanity metrics lie?</summary>
+        <div class="answer">
+          <p>The metric closest to the user's actual goal: <strong>task success</strong> (ticket resolved, code committed, answer accepted-and-kept), backed by implicit behavior like edit rate. Vanity metrics lie because they measure activity, not outcomes, and often move in the wrong direction relative to value: thumbs-up rate can be inflated by who you ask; messages-per-session can rise precisely because the assistant got confusing and users re-ask; acceptance rate can look great when "accept" is one click people use to dismiss. The test for any metric: if it doubled, would a user genuinely be better off? If not, it's vanity. Anchor on outcomes, and triangulate several signals rather than trusting one.</p>
+        </div>
+      </details>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Your new prompt scores higher on helpfulness but the eval also shows format-valid dropping from 98% to 82%. Ship it?</summary>
+        <div class="answer">
+          <p>No — that's a regression. The 16-point drop in format-valid means roughly one in six outputs no longer parses, which will break whatever downstream code consumes the structured output. A win on one metric never justifies an unexplained drop on another. Either fix the prompt so it keeps the format <em>and</em> the helpfulness gain, or reject it. This is exactly why you score the whole scorecard, not just the metric you set out to improve.</p>
+        </div>
+      </details>
+
+      <details class="quiz">
+        <summary>Why isn't an LLM-as-judge score trustworthy on its own?</summary>
+        <div class="answer">
+          <p>Because the judge is itself an LLM with its own biases — position bias (favoring the first option shown), verbosity/style bias (rewarding longer, prettier answers), and possible self-preference for its own model family. A judge you haven't validated can rank a regression as an improvement with total confidence. Before trusting it, measure its agreement with human labels on a sample; mitigate position bias by averaging both orderings; and re-validate whenever you change the judge model. The judge is a tool that needs its own eval.</p>
+        </div>
+      </details>
+
+      <details class="quiz">
+        <summary>Thumbs-up rate on your feature is climbing month over month. Is the feature getting better?</summary>
+        <div class="answer">
+          <p>Not necessarily — that's a candidate vanity metric. The rate can climb for reasons unrelated to quality: maybe the button only appears after a successful flow (survivorship), maybe a UI change made the thumbs-up easier to hit, maybe your happiest cohort grew. Confirm it against outcome-based signals — task success, edit rate, retention — and check whether the offline eval scorecard agrees. If the activity metric rises while outcome metrics stay flat or fall, users aren't better off.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

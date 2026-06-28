@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P3 · Agents</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P3</div>
+      <h1>Agents</h1>
+      <p class="lede">A single model call answers a question. An <strong>agent</strong> chases a goal: it calls a tool, looks at what came back, decides what to do next, and keeps going until the job is done. That loop is most of the value — and most of the danger. This page is about building the loop so it finishes, stays cheap, and doesn't melt down when a tool misbehaves.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>A plain model call is like asking a smart friend a question and getting one answer. An agent is like handing that friend a phone, a calculator, and your credit card and saying "book me a table somewhere good tonight." Now they can look things up, try things, and react to what they find — but you also really want a spending limit and a "stop after 10 phone calls" rule, because they will happily keep dialing forever if something goes wrong.</p>
+      </div>
+
+      <h2>One model call vs. the agent loop</h2>
+      <p>A single call is stateless and one-shot: prompt in, text out. It can't check anything in the world, can't react to a result, and can't recover if it guessed wrong. An agent wraps the model in a <strong>loop</strong> that gives it hands and a feedback channel:</p>
+
+      <pre><code><span class="tok-com"># a single call — no feedback, no actions</span>
+answer = model(prompt)
+
+<span class="tok-com"># an agent — observe, think, act, repeat</span>
+messages = [system_prompt, user_goal]
+<span class="tok-key">for</span> step <span class="tok-key">in</span> range(MAX_STEPS):        <span class="tok-com"># loop guard (see below)</span>
+    reply = model(messages, tools=registry)
+    <span class="tok-key">if</span> reply.is_final:                <span class="tok-com"># model says it's done</span>
+        <span class="tok-key">return</span> reply.text
+    result = run_tool(reply.tool_call)   <span class="tok-com"># ACT in the world</span>
+    messages.append(reply)               <span class="tok-com"># remember what it asked</span>
+    messages.append(result)              <span class="tok-com"># OBSERVE the result, feed it back</span>
+<span class="tok-key">raise</span> StepLimitExceeded            <span class="tok-com"># never trust the loop to end on its own</span></code></pre>
+
+      <p>The four beats of the loop: <strong>observe</strong> (read the latest tool result), <strong>think</strong> (the model reasons over the running transcript), <strong>act</strong> (it emits a tool call), <strong>get result</strong> (you run the tool and append the output). Then repeat. The whole conversation — every call, every result — accumulates in <code>messages</code>, which is why agents get expensive: each step re-sends the entire growing transcript.</p>
+
+      <div class="callout key">
+        <span class="label">The one idea to keep</span>
+        <p>An agent is a <strong>loop where the model chooses the next action and the world answers back</strong>. The model never touches your systems directly — it can only <em>request</em> a tool call as structured data. <strong>Your code</strong> decides whether to run it, runs it, and hands back the result. That gap between "the model asked" and "the system did" is where every safety control — validation, sandboxing, approvals, retries, budgets — lives.</p>
+      </div>
+
+      <h2>Walk one loop iteration</h2>
+      <p>Here's a single goal moving through the loop. Watch the control bounce between the model (decides) and your code (runs the tool, feeds the result back).</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="One trip around the agent loop"
+        data-sub="Goal: find a customer's most recent order total. Click Next to follow control between the model and your runtime."
+        data-steps='[
+          {"op":"user goal","shape":"What did Acme last spend?","note":"The goal enters the transcript as the first user message. No tool has run yet."},
+          {"op":"model thinks → picks a tool","shape":"call lookup_customer(name=Acme)","note":"The model cannot read your database. It emits a structured tool call — a request — and pauses."},
+          {"op":"your code runs the tool","shape":"{id: 4471, name: Acme}","note":"Your runtime validates the args, runs the function, and appends the JSON result to the transcript. This is the ACT + OBSERVE beat."},
+          {"op":"model thinks again","shape":"call get_orders(id=4471)","note":"Now it has the id. It reasons over the updated transcript and decides the NEXT action — this is why one call is not enough."},
+          {"op":"your code runs the tool","shape":"[{total: 1240, date: ...}]","note":"Second tool runs; its result is appended. The model now has everything it needs."},
+          {"op":"model emits final answer","shape":"Acme last spent $1,240.","note":"No tool call this time — the model returns plain text. is_final is true, so the loop exits cleanly."}
+        ]'
+        data-cap="Two tool calls, three model turns. Each <strong>model turn re-sends the whole transcript</strong> — so cost grows with every step, which is the headline of the next section."></div>
+
+      <h2>The tool registry: what the model is allowed to do</h2>
+      <p>The model can only call tools you have <strong>declared</strong>. A tool declaration is a name, a description, and a JSON Schema for its arguments. The description and schema are the entire interface — the model picks a tool by reading them, so they are prompt-engineering, not afterthoughts.</p>
+
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">get_orders</span>(customer_id: int, limit: int = 10): ...
+
+<span class="tok-com"># what the model actually sees:</span>
+{
+  <span class="tok-str">"name"</span>: <span class="tok-str">"get_orders"</span>,
+  <span class="tok-str">"description"</span>: <span class="tok-str">"List a customer's orders, newest first. Use after you have a customer_id."</span>,
+  <span class="tok-str">"input_schema"</span>: {
+    <span class="tok-str">"type"</span>: <span class="tok-str">"object"</span>,
+    <span class="tok-str">"properties"</span>: {
+      <span class="tok-str">"customer_id"</span>: {<span class="tok-str">"type"</span>: <span class="tok-str">"integer"</span>},
+      <span class="tok-str">"limit"</span>: {<span class="tok-str">"type"</span>: <span class="tok-str">"integer"</span>, <span class="tok-str">"default"</span>: <span class="tok-num">10</span>}
+    },
+    <span class="tok-str">"required"</span>: [<span class="tok-str">"customer_id"</span>]
+  }
+}</code></pre>
+
+      <p>The model returns a structured call — <code>get_orders(customer_id=4471)</code> — that your runtime parses and dispatches. Practical registry rules:</p>
+      <ul>
+        <li><strong>Few, sharp tools beat many fuzzy ones.</strong> A model staring at 60 overlapping tools picks wrong; 8 well-named ones with clear descriptions go far. If two tools overlap, the model will dither between them.</li>
+        <li><strong>The description is the contract.</strong> Say when to use it, what it returns, and its preconditions ("use after you have a customer_id"). Schema constraints (enums, required fields, ranges) prevent malformed calls before they ever run.</li>
+        <li><strong>Return structured, compact results.</strong> Every tool result is re-sent on the next turn, so a tool that dumps 20 KB of JSON inflates the cost of <em>every</em> later step. Return the fields the model needs, not the raw payload.</li>
+      </ul>
+
+      <h2>Termination &amp; loop guards: making sure it stops</h2>
+      <p>The model decides when it's done — and sometimes it never decides. A flaky tool, an impossible goal, or a confused plan can put the agent into a loop that calls the same tool forever. <strong>You</strong> are responsible for stopping it. Layer several independent guards; do not rely on the model to behave:</p>
+      <ul>
+        <li><strong>Max steps.</strong> A hard cap on loop iterations (e.g. 10–25). Simple, and it catches everything eventually.</li>
+        <li><strong>No-progress / repeat detection.</strong> If the model issues the <em>same tool call with the same arguments</em> twice, or cycles A→B→A→B, it's stuck. Detect the repeat and break — feeding back "you already tried that" sometimes unsticks it, otherwise bail.</li>
+        <li><strong>Budget caps.</strong> Track cumulative tokens and dollars across the whole run; stop when you cross a ceiling (stop after $0.50 or 100K tokens). Time budgets too — a wall-clock deadline for the whole task.</li>
+      </ul>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha: the infinite loop that bills you</span>
+        <p>The classic agent disaster: a tool starts returning an error the model can't fix, so the model retries it, gets the same error, retries again… forever. With no step cap and no budget cap, a single stuck request can fire <em>thousands</em> of model calls overnight and run up a real bill — each call re-sending an ever-growing transcript, so it gets <em>more</em> expensive per step, not less. Always set <code>MAX_STEPS</code> and a dollar ceiling <em>before</em> you ship, not after the invoice. Treat hitting a guard as a normal, expected exit — log it, return a partial answer, move on.</p>
+      </div>
+
+      <h2>Cost and latency grow every step</h2>
+      <p>Because each model turn re-sends the full transcript, an agent's cost per step <em>climbs</em> as the conversation grows — and total latency is the sum of every model turn plus every tool's runtime. A 6-step agent is not 6× one call; it's more, because the later calls carry more context. This is the single most surprising thing for engineers new to agents.</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Cost accumulates as the loop runs"
+        data-sub="Per-step model cost vs. running total over a 6-step task. Later steps cost more because the transcript keeps growing."
+        data-groups='["Step 1","Step 2","Step 3","Step 4","Step 5","Step 6"]'
+        data-series='[
+          {"name":"This step","color":"#57b6f5","values":[0.8,1.1,1.5,2.0,2.6,3.3]},
+          {"name":"Running total","color":"#f0986b","values":[0.8,1.9,3.4,5.4,8.0,11.3]}
+        ]'
+        data-unit=" ¢"
+        data-cap="Toy numbers, real shape: the blue bars rise (longer transcript each turn), and the orange total curves upward. <strong>Prompt caching</strong> flattens the blue bars — the unchanging prefix is billed at a discount — which is why it is the first cost lever to reach for in an agent."></div>
+
+      <p>Levers that actually move the bill: <strong>prompt caching</strong> (the system prompt + tool defs + early transcript are stable, so cache them and pay a fraction on every later step); <strong>compact tool results</strong> (don't re-send 20 KB you'll re-send again); <strong>a smaller model for the loop</strong> (Haiku 4.5 for routine tool-picking, escalate to Sonnet/Opus only when a step needs deeper reasoning); and <strong>fewer steps</strong> via parallel tool calls and good planning.</p>
+
+      <h2>When tools fail: retries, fallbacks, surfacing</h2>
+      <p>Real tools error, time out, rate-limit, and return junk. The agent's reliability is mostly your <em>error-handling</em> reliability. A tiered response:</p>
+      <ul>
+        <li><strong>Retry transient failures</strong> — timeouts, 503s, rate limits — with exponential backoff and a small retry cap. Don't retry a 400 (bad arguments): that's deterministic, it'll fail identically.</li>
+        <li><strong>Feed real errors back to the model as a tool result.</strong> Often the best recovery is to return <code>{error: "no customer named Acme; try a fuzzy search"}</code> and let the model adapt — it'll pick a different tool or fix its arguments. The model is a recovery mechanism, not just a caller.</li>
+        <li><strong>Fall back</strong> to a degraded path (cached data, a simpler tool, a secondary provider) when the primary is down.</li>
+        <li><strong>Surface to the user</strong> when you're out of options. A wrong-but-confident answer is worse than "I couldn't reach the orders system — try again shortly." Never let a tool failure get silently laundered into a hallucinated result.</li>
+      </ul>
+
+      <div class="callout warn">
+        <span class="label">Validate tool output, don't just trust it</span>
+        <p>A tool returning HTTP 200 doesn't mean the result is sane. An empty list, a malformed row, or a stale value will get fed straight back to the model, which may build a confident answer on garbage. Validate and shape tool results before they re-enter the transcript — and remember that tool output (a web page, a doc, a DB field) can carry <strong>injected instructions</strong>. Treat it as untrusted data, never as commands to obey.</p>
+      </div>
+
+      <h2>Parallel vs. sequential tool calls</h2>
+      <p>If the next actions don't depend on each other — check weather in three cities, fetch a user's orders <em>and</em> their support tickets — the model can request several tool calls in one turn and your runtime can run them <strong>concurrently</strong>. Latency drops from the sum to the max:</p>
+
+      <div class="diagram">
+        <p><strong>Sequential:</strong> call A (300 ms) → call B (300 ms) → call C (300 ms) = <span class="shape">~900 ms</span></p>
+        <p><strong>Parallel:</strong> A, B, C dispatched together, await all = <span class="shape">~300 ms</span></p>
+        <div class="cap">Only safe when the calls are independent. If B needs A's result, they're a chain and must stay sequential.</div>
+      </div>
+
+      <p>The catch: parallelism helps only for <em>independent</em> work. Most multi-step agent tasks are a dependency chain (you need the customer_id before you can fetch their orders), and those stay sequential no matter what. Look for fan-out — one step that spawns several independent lookups — and parallelize there.</p>
+
+      <h2>Planning vs. reactive</h2>
+      <p>Two postures, and good agents mix them:</p>
+      <ul>
+        <li><strong>Reactive</strong> (the default loop above): decide one action, see the result, decide the next. Robust to surprises because every decision uses fresh information — but it can wander on a long task with no map.</li>
+        <li><strong>Planning</strong>: ask the model to lay out the steps first ("1. find customer, 2. pull orders, 3. sum totals"), then execute against that plan, re-planning when reality diverges. This shines on multi-step tasks with clear structure — it keeps the agent on-track and makes its intent inspectable.</li>
+      </ul>
+      <p>Rule of thumb: <strong>plan when the task is long and structured; stay reactive when it's short or unpredictable.</strong> A plan that the agent can't deviate from is brittle; the strong pattern is "plan, then react against the plan, re-planning when a step fails."</p>
+
+      <h2>Observability: you cannot operate what you cannot see</h2>
+      <p>An agent is a non-deterministic, multi-step, multi-cost process. When one misbehaves in production — wrong answer, $40 run, 90-second latency — you need to replay exactly what happened. <strong>Trace every step</strong>: the model's input and output, each tool call's arguments and result, per-step tokens, cost, and latency, and which guard (if any) ended the run.</p>
+
+      <div class="callout key">
+        <span class="label">Why tracing is non-negotiable in production</span>
+        <p>Without traces, every agent bug is unreproducible — the run is gone and the next run takes a different path. With traces you can answer the only questions that matter on-call: <em>where did it go wrong, how much did it cost, and how long did it take?</em> A trace also turns vague "the agent is dumb" complaints into a concrete failing step you can fix, and it's the raw material for evals — you replay real traces to measure whether a prompt or tool change made the agent better or worse.</p>
+      </div>
+
+      <h2>Human-in-the-loop: approvals for risky actions</h2>
+      <p>Some actions are irreversible: sending money, deleting records, emailing a customer, deploying code. For those, the agent shouldn't act autonomously — it should <strong>pause and ask</strong>. Classify tools by blast radius: read-only tools run freely; mutating or external-facing tools require an approval gate where a human sees the exact action and its arguments and clicks yes/no before your runtime executes it.</p>
+      <p>This is the same model/runtime gap from the start of the page: the model can only <em>request</em> the action; your code holds it at the gate. Approvals are cheap insurance against the one runaway action that can't be undone — and they pair naturally with sandboxing (run tool code with least privilege) and per-tool budgets.</p>
+
+      <h2>How this shows up in the interview</h2>
+
+      <h3>Q: An agent in production sometimes loops forever or gives wrong answers when a tool fails. How do you make it reliable?</h3>
+      <p>Attack it in layers. <strong>Loops:</strong> a hard <code>MAX_STEPS</code> cap plus repeat-detection (same tool + same args twice ⇒ break) plus a wall-clock and dollar budget — independent guards so one catches what another misses. <strong>Tool failures:</strong> retry transient errors (timeout, 503, rate-limit) with backoff and a retry cap; don't retry deterministic 400s; feed real errors back to the model as a tool result so it can adapt; fall back to a degraded path; and surface honestly to the user when out of options rather than letting a failure become a hallucinated answer. <strong>Validate tool output</strong> before it re-enters the transcript so garbage doesn't drive a confident wrong answer. And make all of this visible with tracing so you can actually diagnose the next failure. The meta-point interviewers want: the model is unreliable by nature; reliability is engineered in the <em>loop around it</em>.</p>
+
+      <h3>Q: This agent is too expensive. How do you cap and reduce cost?</h3>
+      <p>First <strong>cap</strong> it so it can't surprise you: track cumulative tokens and dollars per run and stop at a ceiling; cap steps. Then <strong>reduce</strong>: enable <strong>prompt caching</strong> on the stable prefix (system prompt + tool defs + early transcript) since every step re-sends it — this is the biggest single win because cost-per-step otherwise climbs as the transcript grows; keep tool results compact so you're not re-sending the same KBs each turn; use a cheaper model (Haiku 4.5) for routine tool-selection and escalate to a stronger one only for hard steps; and cut the number of steps via parallel tool calls and lightweight planning. Show the cost growth with a per-step breakdown and you've demonstrated you understand <em>why</em> agents are expensive, not just that they are.</p>
+
+      <h3>Q: Design an agent platform other teams build on. What are the core pieces?</h3>
+      <p>A loop runtime plus the guardrails teams shouldn't have to reinvent: a <strong>tool registry</strong> with schema validation and per-tool permission/blast-radius tags; <strong>tool sandboxing</strong> (least-privilege execution, network/filesystem isolation) so a buggy or malicious tool can't reach beyond its mandate; built-in <strong>retries/timeouts/fallbacks</strong> with sane defaults; <strong>loop guards</strong> (max steps, repeat detection) and <strong>budgets</strong> (tokens, dollars, wall-clock) enforced centrally per run and per tenant; an <strong>approval/human-in-the-loop</strong> gate for tools flagged risky; and <strong>tracing/observability</strong> for every step (inputs, tool calls, cost, latency, exit reason) feeding dashboards, alerts, and an eval harness. The framing to lead with: the platform's job is to make the safe path the default — teams declare tools and goals; the platform owns termination, cost control, isolation, and visibility.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Why does cost per step tend to rise as an agent runs, and what's the single most effective lever against it?</summary>
+        <div class="answer">
+          <p>Each model turn re-sends the <em>entire growing transcript</em> (every prior call and tool result), so later turns carry more input tokens and cost more than earlier ones — total cost curves upward, not linearly. The most effective lever is <strong>prompt caching</strong>: the system prompt, tool definitions, and early transcript are a stable prefix, so caching them means you pay only a fraction to re-send them each step. Compact tool results and using a cheaper model for routine steps help too, but caching attacks the growth directly.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>A tool keeps returning an error the model can't resolve. Name two independent guards that would stop the agent, and one thing you should NOT rely on.</summary>
+        <div class="answer">
+          <p>Independent guards: (1) a <strong>max-steps cap</strong> that breaks the loop after N iterations regardless of state, and (2) a <strong>budget cap</strong> (cumulative tokens/dollars/wall-clock) that stops the run when it crosses a ceiling. Repeat-detection (same tool + same args twice ⇒ break) is a great third. What you should NOT rely on: <strong>the model deciding to stop on its own</strong> — a stuck model will happily retry forever, which is exactly the runaway-cost failure mode.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>When is it safe to run tool calls in parallel, and why are most multi-step agent tasks still sequential?</summary>
+        <div class="answer">
+          <p>Parallel is safe only when the calls are <strong>independent</strong> — none needs another's result (e.g. weather in three cities). Then latency drops from the sum of the calls to the max. Most agent tasks are <strong>dependency chains</strong>: you need the customer_id before you can fetch their orders, so those steps must stay sequential. The win is to spot <em>fan-out</em> — a single step that spawns several independent lookups — and parallelize just that.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>The model "deleted a production record." Where in the agent architecture should that have been prevented, and how?</summary>
+        <div class="answer">
+          <p>At the <strong>model/runtime gap</strong>: the model can only <em>request</em> a tool call as structured data — your code decides whether to run it. A destructive tool like <code>delete_record</code> should be tagged risky and sit behind a <strong>human-in-the-loop approval gate</strong> (a human sees the exact action + arguments and confirms before execution), ideally combined with <strong>sandboxing/least-privilege</strong> so the tool can't exceed its mandate. Reversible/read-only tools run freely; irreversible ones pause for a human. The model is never trusted to self-restrain on dangerous actions.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

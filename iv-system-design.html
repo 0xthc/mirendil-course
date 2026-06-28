@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Interview · System-design walkthroughs</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Interview prep</div>
+      <h1>System-design walkthroughs</h1>
+      <p class="lede">A reusable method for LLM system-design interviews, then four worked walkthroughs you can study end to end. The goal is not to memorize answers — it is to internalize a <em>structure</em> you can apply to any prompt the interviewer throws at you.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>A system-design interview is like being asked to plan a road trip out loud. Nobody expects you to already know every street. They want to see how you think: where are we going (requirements), what does the car need to do (the contract), what is the route (data flow), what happens at rush hour (scale), what if a tire blows (failure), and what does gas cost (budget). Say those six things in order, out loud, every time — and you will sound senior even on a topic you have never seen.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">What is actually being graded</span>
+        <p>Interviewers are grading your <strong>structure</strong> and your <strong>tradeoff reasoning</strong> — not whether you arrive at one canonical right answer. A candidate who names the constraints, proposes a clean contract, and says <em>here is the cheap option, here is the fast option, and here is why I would pick this one</em> beats a candidate who blurts a perfect-sounding architecture with no justification. Think out loud. Make your assumptions explicit. Compare at least two options at every fork.</p>
+      </div>
+
+      <h2 id="part-a">Part A · A method for LLM system-design interviews</h2>
+      <p>Run these six steps in order, every time. The first two are where most candidates skip ahead and lose points; slow down there. The last two are where senior candidates separate themselves; do not run out of time before you reach them.</p>
+
+      <ol>
+        <li><strong>Clarify requirements &amp; scale.</strong> Who uses this, for what? Read-heavy or write-heavy? What is the QPS today and at 100×? Latency target (interactive chat vs. batch)? What is the context size — a 2K prompt or a 200K-token document? What is explicitly <em>out</em> of scope? Write the numbers down where the interviewer can see them.</li>
+        <li><strong>Sketch the API / contract.</strong> Define the request and response shape before any boxes. One or two endpoints, the fields, whether it streams, and the error contract. The contract pins down the problem and stops you from designing in the air.</li>
+        <li><strong>Data flow &amp; components.</strong> Draw the path a request takes through the system, box by box: gateway, the LLM call, any retrieval, any cache, the datastore, the queue. Keep it to the components the contract actually needs.</li>
+        <li><strong>Scale it.</strong> Now stress the diagram: where is the latency budget spent, what is the throughput ceiling, what do you cache, what do you replicate, what do you shard. Tie every choice back to a number from step 1.</li>
+        <li><strong>Failure modes &amp; reliability.</strong> What happens when the model provider is slow or returns a 529, when a dependency is down, when you hit a rate limit, when a request is retried? Timeouts, retries with backoff, idempotency, graceful degradation, fallback to a smaller model.</li>
+        <li><strong>Cost.</strong> Put a dollar figure on it. Tokens dominate LLM cost, so estimate input/output tokens per request × price per token × volume, then name the biggest lever (usually prompt caching, model tiering, or shorter context).</li>
+      </ol>
+
+      <div class="viz" data-viz="flow"
+        data-title="The six-step method, as a loop you walk out loud"
+        data-sub="Step through it. In a real interview you narrate each box as you draw it."
+        data-steps='[
+          {"op":"1 · Clarify requirements & scale","shape":"numbers on the board","note":"Users, QPS now and at 100×, latency target, context size, what is out of scope. Do not move on until you have written the numbers down."},
+          {"op":"2 · Sketch the API / contract","shape":"request → response","note":"One or two endpoints, the fields, streaming or not, the error contract. Pin the problem before drawing boxes."},
+          {"op":"3 · Data flow & components","shape":"the boxes","note":"Trace one request through gateway, LLM call, retrieval, cache, datastore, queue. Only the components the contract needs."},
+          {"op":"4 · Scale it","shape":"latency · throughput · caching","note":"Where does the latency budget go? What is the throughput ceiling? What do you cache, replicate, shard? Tie each choice to a number from step 1."},
+          {"op":"5 · Failure modes & reliability","shape":"what breaks, what then","note":"Provider slow or 529, dependency down, rate-limited, retried. Timeouts, backoff, idempotency, degrade gracefully, fall back to a smaller model."},
+          {"op":"6 · Cost","shape":"$ per request × volume","note":"Tokens dominate. Estimate input/output tokens × price × volume, then name the biggest lever: prompt caching, model tiering, shorter context."}
+        ]'
+        data-cap="Six steps, in order. Spend real time on 1 and 2; do not run out of clock before 5 and 6."></div>
+
+      <div class="callout gotcha">
+        <span class="label">The most common way candidates lose</span>
+        <p>Diving into code or component boxes <em>before</em> clarifying requirements. The interviewer says <em>build a rate limiter</em> and the candidate immediately starts writing a token-bucket class. Stop. You do not yet know: limit per user or per org? Limit requests, tokens, or both? What is the QPS? Single region or global? Five clarifying questions take ninety seconds and reshape the entire design. Asking them is not a stall — it is the single strongest signal of seniority you can send.</p>
+      </div>
+
+      <h2 id="part-b">Part B · Four worked walkthroughs</h2>
+      <p>Each walkthrough follows the same skeleton: the prompt, clarifying questions, a proposed design with a request-path flow and a static architecture sketch, key tradeoffs, scaling / failure / cost notes, and the follow-ups an interviewer is likely to push on.</p>
+
+      <!-- ============ WALKTHROUGH 1: PROMPT CACHING ============ -->
+      <h3 id="w1">1 · A prompt-caching layer for a chat product</h3>
+      <p><strong>Prompt:</strong> <em>Our chat product re-sends a large system prompt and growing conversation history on every turn. Design a caching layer that cuts latency and cost.</em></p>
+
+      <h4>Clarifying questions</h4>
+      <ul>
+        <li>Is the cost driver a long, <em>stable</em> system prompt / tool schema, a long document in context, or the conversation history itself? (Changes what is cacheable.)</li>
+        <li>Are we talking about provider-side <strong>prompt caching</strong> (the model vendor caches the KV state of a prefix) or an application-side <strong>response cache</strong> (we skip the model entirely for repeated inputs)? Both are valid; they solve different problems.</li>
+        <li>How long do conversations live, and how many turns? What is the cache TTL we can tolerate?</li>
+        <li>What is the target hit rate, and what is the penalty for a stale answer?</li>
+      </ul>
+
+      <h4>Proposed design</h4>
+      <p>Two layers, because they win in different places:</p>
+      <ul>
+        <li><strong>Provider prompt caching</strong> for the stable prefix. Order the prompt so the unchanging parts come first — system prompt, tool definitions, few-shot examples, any pinned document — and mark a cache breakpoint after them. The provider caches the KV state of that prefix; subsequent turns reuse it. Cached input tokens are far cheaper and skip re-prefill, which cuts time-to-first-token. This does <em>not</em> change the output, so there is no correctness risk.</li>
+        <li><strong>Application response cache</strong> (Redis) for exact or near-exact repeated requests — FAQ-style turns, regenerations, idempotent retries. Key on a hash of the full resolved prompt; return the stored completion on a hit and never call the model.</li>
+      </ul>
+
+      <div class="viz" data-viz="flow"
+        data-title="Request path through the two-layer cache"
+        data-sub="A chat turn arrives; follow it through both caches to the model and back."
+        data-steps='[
+          {"op":"turn arrives","shape":"system + history + new msg","note":"Assemble the prompt with the stable prefix first (system prompt, tools, pinned docs), then the volatile suffix (recent history, new user message)."},
+          {"op":"response-cache lookup","shape":"hash(resolved prompt)","note":"Redis GET on a hash of the fully resolved prompt. On an exact hit, return the stored completion and stop — zero model cost."},
+          {"op":"miss → call model with cache breakpoint","shape":"cached prefix + fresh suffix","note":"Provider serves the prefix from its prompt cache (cheap cached-input tokens, no re-prefill) and only processes the new suffix."},
+          {"op":"model streams completion","shape":"lower TTFT","note":"Time-to-first-token drops because the expensive prefill of the long stable prefix was skipped."},
+          {"op":"write-through","shape":"SET key → completion","note":"Store the completion in Redis with a TTL so the next identical turn is a response-cache hit."}
+        ]'
+        data-cap="Layer 1 (response cache) can skip the model entirely; layer 2 (provider prompt cache) makes the unavoidable calls cheaper and faster."></div>
+
+      <div class="diagram">
+        <p>
+        client<br>
+        &nbsp;&nbsp;│ chat turn<br>
+        &nbsp;&nbsp;▼<br>
+        [ API gateway ] ──▶ [ prompt assembler ] &nbsp;<em>stable prefix first, volatile suffix last</em><br>
+        &nbsp;&nbsp;│<br>
+        &nbsp;&nbsp;▼<br>
+        [ response cache · Redis ] ──hit──▶ return stored completion<br>
+        &nbsp;&nbsp;│ miss<br>
+        &nbsp;&nbsp;▼<br>
+        [ model client ] ──▶ [ LLM w/ prompt caching ] &nbsp;<em>prefix served from KV cache</em><br>
+        &nbsp;&nbsp;│<br>
+        &nbsp;&nbsp;▼<br>
+        write-through to Redis (TTL) &nbsp;+&nbsp; stream to client
+        </p>
+        <div class="cap">Two caches in series: an application response cache that can skip the model, and provider prompt caching that discounts the calls you still have to make.</div>
+      </div>
+
+      <h4>Key tradeoffs</h4>
+      <ul>
+        <li><strong>Prefix ordering vs. flexibility.</strong> Prompt caching only helps if the prefix is byte-identical across turns. Any per-turn personalization injected near the top busts the cache. You trade some prompt flexibility for cache hits — keep volatile content at the end.</li>
+        <li><strong>Response cache freshness vs. hit rate.</strong> A long TTL lifts hit rate but risks serving stale answers; for anything time-sensitive or user-specific, scope the key tightly or skip layer 1 entirely.</li>
+        <li><strong>Cache-write cost.</strong> Provider prompt caching typically charges a small premium to <em>write</em> the cache and a deep discount to <em>read</em> it, so it pays off only when the prefix is reused enough times to amortize the write.</li>
+      </ul>
+
+      <h4>Scaling, failure &amp; cost</h4>
+      <p><strong>Hit-rate math.</strong> Say a turn is 8,000 stable-prefix tokens + 500 fresh tokens, and a conversation averages 10 turns. Without prompt caching you pay full input price on 8,500 tokens × 10 = 85,000 input tokens. With prompt caching, you pay full price for the prefix once (turn 1), then cached-read price on the 8,000-token prefix for the other 9 turns. If cached reads are ~10% of the normal input price, the prefix cost across the conversation falls by roughly 80–85%. The win scales with prefix size and conversation length.</p>
+      <p><strong>Model tiering compounds it:</strong> route simple turns to <strong>Haiku 4.5</strong>, default to <strong>Sonnet 4.6</strong>, and reserve <strong>Opus 4.8</strong> for hard turns — the caching discount applies on top of the cheaper tier.</p>
+      <p><strong>Failure:</strong> Redis is a soft dependency — on a cache error, fall through to the model rather than failing the request. Provider prompt-cache misses are invisible (you just pay full price that turn), so never depend on a hit for correctness. A short TTL on the provider side means idle conversations re-prefill on resume; warm them if latency on resume matters.</p>
+
+      <h4>Likely follow-ups</h4>
+      <ul>
+        <li><em>How would you measure cache hit rate, and what hit rate makes prompt caching worth the write premium?</em></li>
+        <li><em>The product wants per-user personalization in the system prompt. How do you keep caching while injecting it?</em> (Move it below the breakpoint, or maintain per-user prefixes.)</li>
+        <li><em>How do you prevent the response cache from returning another tenant&rsquo;s answer?</em> (Tenant ID in the key; never share across trust boundaries.)</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Why does putting personalized text at the top of the prompt hurt, even if the rest of the prompt is huge and stable?</summary>
+        <div class="answer">
+          <p>Provider prompt caching keys on an <em>exact prefix</em> of the token stream. The cache can only be reused up to the first byte that differs. If a personalized line sits at the top, every request differs from token one, so nothing downstream — even a 100K-token stable document below it — can be served from cache. Keep all volatile content at the end so the longest possible stable prefix stays cacheable.</p>
+        </div>
+      </details>
+
+      <!-- ============ WALKTHROUGH 2: RAG ============ -->
+      <h3 id="w2">2 · A RAG system for enterprise documents</h3>
+      <p><strong>Prompt:</strong> <em>Build a system that answers employee questions over our internal docs (wikis, PDFs, tickets) with citations.</em></p>
+
+      <h4>Clarifying questions</h4>
+      <ul>
+        <li>How many documents, how often do they change, and how fresh must answers be (minutes, hours, daily)?</li>
+        <li>Are there access-control boundaries — can every user see every doc, or must retrieval respect per-user permissions?</li>
+        <li>Are citations a hard requirement? (They usually are for enterprise trust.)</li>
+        <li>What does <em>good</em> look like — do we have a labeled eval set, or do we need to build one?</li>
+      </ul>
+
+      <h4>Proposed design — two pipelines</h4>
+      <p>RAG is really two systems: an <strong>offline ingest pipeline</strong> and an <strong>online query pipeline</strong>. Design them separately.</p>
+      <ul>
+        <li><strong>Ingest:</strong> connectors pull source docs → clean &amp; normalize → <strong>chunk</strong> (semantic or heading-aware, with overlap) → <strong>embed</strong> each chunk → upsert vectors + metadata (source URL, ACL, timestamp) into a vector index. Re-run incrementally on document changes.</li>
+        <li><strong>Query:</strong> embed the question → <strong>retrieve</strong> top-K by vector similarity (plus optional keyword/BM25 hybrid) → <strong>rerank</strong> to a tight top-N → assemble a grounded prompt with the chunks and their IDs → <strong>generate</strong> with citations → return answer + source links.</li>
+      </ul>
+
+      <div class="viz" data-viz="flow"
+        data-title="The online query path"
+        data-sub="A question arrives; follow it from embedding to a cited answer."
+        data-steps='[
+          {"op":"question arrives","shape":"natural-language query","note":"Plus the user identity, which carries the ACL we will filter retrieval by."},
+          {"op":"embed query","shape":"query vector","note":"Same embedding model used at ingest time, or retrieval quality collapses. Version the embedding model."},
+          {"op":"retrieve top-K","shape":"K ≈ 20 candidates","note":"Vector similarity over the index, filtered by the user’s permissions. Optionally fuse with BM25 keyword search for exact-term recall (hybrid)."},
+          {"op":"rerank → top-N","shape":"N ≈ 5 best chunks","note":"A cross-encoder reranker scores each candidate against the query and keeps the few most relevant. Big precision win for a small latency cost."},
+          {"op":"assemble grounded prompt","shape":"chunks + IDs + question","note":"Instruct the model to answer only from the provided context and to cite chunk IDs. Stable instructions go first so prompt caching applies."},
+          {"op":"generate with citations","shape":"answer + source links","note":"Model writes the answer and emits the chunk IDs it used; we map those back to source URLs for the user to verify."}
+        ]'
+        data-cap="Retrieve wide, rerank narrow, generate grounded. The rerank step is what turns recall into precision."></div>
+
+      <div class="diagram">
+        <p>
+        <strong>INGEST (offline)</strong><br>
+        sources (wiki · PDF · tickets) ──▶ [ connectors ] ──▶ [ clean / normalize ]<br>
+        &nbsp;&nbsp;──▶ [ chunk + overlap ] ──▶ [ embed ] ──▶ [ vector index + metadata/ACL ]<br>
+        <br>
+        <strong>QUERY (online)</strong><br>
+        user ──▶ [ gateway ] ──▶ [ embed query ] ──▶ [ retrieve top-K · ACL filter ]<br>
+        &nbsp;&nbsp;──▶ [ reranker → top-N ] ──▶ [ prompt assembler ] ──▶ [ LLM ] ──▶ answer + citations<br>
+        <br>
+        <strong>EVAL (continuous)</strong> &nbsp; labeled Q/A set ──▶ retrieval recall@K + answer faithfulness
+        </p>
+        <div class="cap">Three loops: ingest builds the index, query serves answers, eval keeps both honest. Metadata/ACL travels with every chunk so permissions are enforced at retrieval.</div>
+      </div>
+
+      <h4>Key tradeoffs</h4>
+      <ul>
+        <li><strong>Chunk size.</strong> Small chunks give precise retrieval but fragment context; large chunks preserve context but dilute relevance and waste tokens. Heading-aware chunking with overlap is the usual compromise.</li>
+        <li><strong>Top-K vs. cost/latency.</strong> Retrieving more candidates lifts recall but inflates rerank work and prompt tokens. Retrieve wide, rerank to a small N, and stuff only the N best into context.</li>
+        <li><strong>Hybrid vs. pure vector.</strong> Pure vector search misses exact identifiers (error codes, SKUs); adding BM25 keyword search recovers them, at the cost of a second index and fusion logic.</li>
+        <li><strong>Freshness vs. ingest cost.</strong> Re-embedding everything is expensive; incremental upserts keyed on a content hash keep the index fresh without full rebuilds.</li>
+      </ul>
+
+      <h4>Scaling, failure &amp; cost</h4>
+      <p><strong>Scale:</strong> ingest is embarrassingly parallel — fan out embedding across workers and batch upserts. The vector index is the stateful bottleneck; pick one that shards and supports metadata filtering at scale. Cache embeddings of repeated queries.</p>
+      <p><strong>Failure:</strong> if retrieval returns nothing relevant, the model must say <em>I don&rsquo;t know</em> rather than hallucinate — enforce grounding in the system prompt and verify with eval. Stale index → wrong answers; alert on ingest lag. Citations let users catch errors the system cannot.</p>
+      <p><strong>Cost &amp; eval:</strong> generation tokens dominate, so trim context to the reranked top-N and use prompt caching for the stable instruction block. Use <strong>Haiku 4.5</strong> for cheap retrieval-quality checks and <strong>Sonnet 4.6</strong> or <strong>Opus 4.8</strong> for final generation. Run a standing eval: retrieval <em>recall@K</em> (did the right chunk make the candidate set?) and answer <em>faithfulness</em> (is every claim supported by a cited chunk?), the latter scored by an LLM judge against a labeled set.</p>
+
+      <h4>Likely follow-ups</h4>
+      <ul>
+        <li><em>A user asks about a doc they are not allowed to see. Where do you enforce that?</em> (At retrieval — ACL filter on the index — never just by hoping the model declines.)</li>
+        <li><em>Retrieval recall is fine but answers are wrong. Where do you look?</em> (Reranking, chunking, prompt grounding, or the generator — bisect with eval.)</li>
+        <li><em>How do you keep answers fresh when a doc changes?</em> (Incremental re-embed on content-hash change; invalidate the affected chunks.)</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Retrieval recall@20 is 95%, but users still get wrong answers. What is the most likely culprit, and how do you confirm?</summary>
+        <div class="answer">
+          <p>If the right chunk is in the candidate set 95% of the time, the failure is <em>downstream</em> of retrieval: either the reranker is dropping the right chunk before it reaches the prompt, or the generator is ignoring the provided context. Confirm by measuring two things separately — rerank precision (is the correct chunk in the final top-N?) and answer faithfulness given a known-good context. If faithfulness is low even when the right chunk is present, fix grounding (prompt instructions, model tier); if the chunk vanishes at rerank, fix the reranker or N.</p>
+        </div>
+      </details>
+
+      <!-- ============ WALKTHROUGH 3: AGENT PLATFORM ============ -->
+      <h3 id="w3">3 · An agent platform</h3>
+      <p><strong>Prompt:</strong> <em>Design a platform that lets internal teams build and run LLM agents that call tools, with safety and cost controls.</em></p>
+
+      <h4>Clarifying questions</h4>
+      <ul>
+        <li>Who writes the tools — a trusted internal team, or untrusted tenants? (Decides how hard the sandbox must be.)</li>
+        <li>Are agents interactive (a user waits) or background (long-running jobs)? Affects timeouts and the execution model.</li>
+        <li>Multi-tenant? If so, what isolation do tenants expect for data, secrets, and spend?</li>
+        <li>What are the hard caps — max steps per run, max dollars per run, max wall-clock?</li>
+      </ul>
+
+      <h4>Proposed design</h4>
+      <p>An agent is a loop: the model proposes a tool call, the platform executes it, feeds the result back, and repeats until the model emits a final answer. The platform&rsquo;s job is to make that loop <em>safe, observable, and bounded</em>.</p>
+      <ul>
+        <li><strong>Tool registry:</strong> declarative tool definitions (name, JSON schema, auth scope, cost weight). The model only ever sees schemas; the platform owns execution.</li>
+        <li><strong>Sandboxed executor:</strong> each tool call runs in an isolated sandbox (container / microVM) with no ambient credentials, an egress allowlist, and a wall-clock timeout. Untrusted tools get a fresh, throwaway environment.</li>
+        <li><strong>Orchestrator:</strong> drives the loop, enforces the step budget and the cost cap, handles retries, and writes a trace span for every step.</li>
+        <li><strong>Budget/cost governor:</strong> a running tally of tokens and tool spend per run and per tenant; the loop halts when a cap is hit.</li>
+        <li><strong>Tracing:</strong> every model call and tool call is a span with inputs, outputs, tokens, latency, and cost — the only way to debug or price an agent.</li>
+      </ul>
+
+      <div class="viz" data-viz="flow"
+        data-title="One iteration of the agent loop"
+        data-sub="Follow a single step from model decision to the next turn, with the guardrails inline."
+        data-steps='[
+          {"op":"model proposes action","shape":"tool call or final answer","note":"The model sees the goal, history, and tool schemas. It either calls a tool or finishes. If it finishes, the loop exits."},
+          {"op":"budget & policy check","shape":"steps · $ · scope","note":"Before executing: are we under the step cap and the cost cap? Is this tool allowed for this tenant and within its auth scope? If not, halt or deny."},
+          {"op":"execute in sandbox","shape":"isolated · no ambient creds · timeout","note":"Run the tool in a throwaway sandbox with an egress allowlist and a wall-clock timeout. Inject only the narrowly scoped credential this tool needs."},
+          {"op":"handle result / retry","shape":"ok · or backoff retry","note":"On a transient error, retry with exponential backoff and a cap. On a hard failure, return a structured error the model can reason about."},
+          {"op":"append observation","shape":"result → context","note":"Feed the tool result back into the conversation and update the token/cost tally."},
+          {"op":"trace the step","shape":"span: in/out, tokens, $, latency","note":"Emit a span tagged with tenant and run ID. The full trace is how you debug, audit, and bill the run."}
+        ]'
+        data-cap="Every iteration passes a budget/policy gate before it touches a tool, runs in isolation, and is traced. That is the whole platform contract."></div>
+
+      <div class="diagram">
+        <p>
+        tenant request ──▶ [ API gateway · authn/z + per-tenant quota ]<br>
+        &nbsp;&nbsp;▼<br>
+        [ orchestrator (agent loop) ] ◀──────────────┐<br>
+        &nbsp;&nbsp;│ proposes tool call &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; observation<br>
+        &nbsp;&nbsp;├──▶ [ budget/cost governor ] &nbsp;<em>steps + $ caps</em><br>
+        &nbsp;&nbsp;├──▶ [ tool registry ] &nbsp;<em>schema + scope lookup</em><br>
+        &nbsp;&nbsp;└──▶ [ sandboxed executor ] ──▶ external API / DB ──┘<br>
+        &nbsp;&nbsp;│<br>
+        &nbsp;&nbsp;▼<br>
+        [ tracing / observability ] ◀── spans from every model & tool call<br>
+        &nbsp;&nbsp;│<br>
+        &nbsp;&nbsp;▼<br>
+        [ LLM ] &nbsp;<em>Haiku 4.5 routing · Sonnet 4.6 default · Opus 4.8 hard steps</em>
+        </p>
+        <div class="cap">The orchestrator is the hub; the governor, registry, sandbox, and tracer wrap every step. Tenancy is enforced at the gateway and carried through every span.</div>
+      </div>
+
+      <h4>Key tradeoffs</h4>
+      <ul>
+        <li><strong>Isolation strength vs. cold-start latency.</strong> A fresh microVM per call is the safest and the slowest; a warm pooled sandbox is fast but leaks state across calls if not reset. Match isolation to trust level.</li>
+        <li><strong>Autonomy vs. control.</strong> A high step cap lets agents solve harder tasks but risks runaway loops and cost; a low cap is safe but brittle. Make it configurable per tool/tenant.</li>
+        <li><strong>Model tier vs. cost.</strong> Running every step on Opus 4.8 is capable but expensive; route routine steps to Haiku 4.5 and escalate to Opus 4.8 only when a step is hard or a cheaper model failed.</li>
+        <li><strong>Retry vs. duplicate side effects.</strong> Retrying a tool that already mutated state can double-charge or double-send — require idempotency keys for any tool with side effects.</li>
+      </ul>
+
+      <h4>Scaling, failure &amp; cost</h4>
+      <p><strong>Scale:</strong> the orchestrator is stateless per step — persist run state externally (DB/queue) so any worker can resume a run; this also makes long background agents survivable across deploys. Pool sandboxes by trust tier.</p>
+      <p><strong>Failure:</strong> a stuck or looping agent is the signature failure — the step cap and cost cap are the backstop. Tool timeouts prevent one hung dependency from hanging the run. A poisoned tool result can derail the model, so validate tool outputs against their schema before feeding them back.</p>
+      <p><strong>Cost:</strong> tokens grow with every loop iteration because history accumulates, so cost is roughly per-step tokens × steps — cap steps, summarize or trim history, and cache the stable system/tool-schema prefix. Per-tenant cost caps prevent one team from draining the budget.</p>
+
+      <h4>Likely follow-ups</h4>
+      <ul>
+        <li><em>An agent is stuck calling the same tool forever. How does your design stop it and how do you debug it?</em> (Step/cost cap halts it; the trace shows the loop.)</li>
+        <li><em>A tenant&rsquo;s tool tries to read another tenant&rsquo;s data. How is that prevented?</em> (No ambient creds; per-call scoped credentials; egress allowlist.)</li>
+        <li><em>How do you bill tenants accurately?</em> (Sum token + tool cost from the per-run trace spans.)</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Why feed scoped, per-call credentials into the sandbox instead of giving the executor a broad service account?</summary>
+        <div class="answer">
+          <p>A broad service account means any tool — including a buggy or malicious one written by a tenant — inherits the union of all permissions, so a single compromised tool can reach data and systems it has no business touching. Scoping a narrow, short-lived credential to each call enforces least privilege: the blast radius of a misbehaving tool is exactly what that one tool was authorized to do, and nothing more. Combined with an egress allowlist and no ambient credentials in the sandbox, it contains both accidents and attacks.</p>
+        </div>
+      </details>
+
+      <!-- ============ WALKTHROUGH 4: RATE LIMITER ============ -->
+      <h3 id="w4">4 · A multi-tenant rate limiter</h3>
+      <p><strong>Prompt:</strong> <em>Design a rate limiter for our LLM API that is fair across tenants and protects the backend.</em></p>
+
+      <h4>Clarifying questions</h4>
+      <ul>
+        <li>Limit per API key, per user, or per org? (Almost always per tenant, sometimes nested.)</li>
+        <li>Limit on <strong>requests per minute</strong>, <strong>tokens per minute</strong>, or both? For LLMs the real scarce resource is tokens, not requests.</li>
+        <li>Single region or global? (Decides whether the counter must be distributed and consistent.)</li>
+        <li>On exceed: reject with 429, or queue/throttle? What does the client contract promise?</li>
+      </ul>
+
+      <h4>Proposed design</h4>
+      <p>For LLM APIs you need <em>two</em> limits enforced together: requests-per-minute (RPM) and tokens-per-minute (TPM). A request passes only if both buckets allow it.</p>
+      <ul>
+        <li><strong>Algorithm:</strong> token-bucket per tenant for each dimension. It allows bursts up to the bucket size and refills at a steady rate — a better fit for bursty LLM traffic than a hard fixed window, and cheaper than a precise sliding-window log.</li>
+        <li><strong>Token cost is estimated up front, reconciled after.</strong> Charge the TPM bucket the estimated input + max output tokens at admission; refund the difference once the real output token count is known. This stops a few huge requests from blowing the budget.</li>
+        <li><strong>Distributed counter:</strong> hold buckets in Redis; do the check-and-decrement atomically (a Lua script) so concurrent requests across API servers cannot oversell the limit.</li>
+        <li><strong>Response contract:</strong> on exceed, return <code>429</code> with <code>Retry-After</code> and the limit headers, so well-behaved clients back off instead of hammering.</li>
+      </ul>
+
+      <div class="viz" data-viz="flow"
+        data-title="Admission decision for one request"
+        data-sub="Two buckets, one atomic check. Follow a request to admit or 429."
+        data-steps='[
+          {"op":"request arrives","shape":"tenant id + estimated tokens","note":"Identify the tenant and estimate the token cost: input tokens now known, output bounded by max_tokens."},
+          {"op":"atomic check: RPM bucket","shape":"1 request available?","note":"Check-and-decrement the requests-per-minute token bucket for this tenant in Redis, atomically via a Lua script."},
+          {"op":"atomic check: TPM bucket","shape":"estimated tokens available?","note":"Same tenant, tokens-per-minute bucket. The request is admitted only if BOTH buckets have room — the tighter limit wins."},
+          {"op":"admit or reject","shape":"200 stream · or 429 + Retry-After","note":"On pass, forward to the model and stream. On fail, return 429 with Retry-After and limit headers so the client backs off cleanly."},
+          {"op":"reconcile after completion","shape":"refund estimate − actual","note":"Once the real output token count is known, credit the TPM bucket the difference between the reserved estimate and actual usage."}
+        ]'
+        data-cap="Reserve on the way in (so you never oversell), reconcile on the way out (so you never overcharge). Both buckets must agree to admit."></div>
+
+      <div class="diagram">
+        <p>
+        clients (tenant A · B · C) ──▶ [ API servers · N replicas ]<br>
+        &nbsp;&nbsp;│ each server runs the same limiter check<br>
+        &nbsp;&nbsp;▼<br>
+        [ rate-limiter middleware ]<br>
+        &nbsp;&nbsp;│ atomic check-and-decrement (Lua)<br>
+        &nbsp;&nbsp;▼<br>
+        [ Redis ] &nbsp; per-tenant buckets: &nbsp; {RPM} &nbsp; {TPM}<br>
+        &nbsp;&nbsp;│ both allow? ──no──▶ 429 + Retry-After<br>
+        &nbsp;&nbsp;▼ yes<br>
+        [ LLM backend ] ──▶ stream ──▶ reconcile TPM (refund unused)<br>
+        <br>
+        <em>fairness: per-tenant buckets isolate noisy neighbors; optional global ceiling protects the backend</em>
+        </p>
+        <div class="cap">Stateless API replicas share one source of truth in Redis. Per-tenant buckets give fairness; a global ceiling gives backpressure for the whole backend.</div>
+      </div>
+
+      <h4>Key tradeoffs</h4>
+      <ul>
+        <li><strong>Token bucket vs. sliding window.</strong> Token bucket allows controlled bursts and is cheap (two numbers per tenant: level + last-refill time). A sliding-window log is more precise at the boundary but stores a timestamp per request — more memory and more work. Token bucket is the usual pick; sliding-window-counter is a middle ground if boundary bursts are a problem.</li>
+        <li><strong>Requests vs. tokens.</strong> Limiting only RPM lets one tenant send a few enormous prompts and starve the backend; limiting only TPM lets a flood of tiny requests overwhelm connection/queue capacity. You need both.</li>
+        <li><strong>Strict consistency vs. latency.</strong> A central Redis check is one extra network hop per request but prevents overselling; local in-memory buckets are faster but drift across replicas and over-admit. For correctness across N servers, centralize.</li>
+        <li><strong>429 vs. queue.</strong> Rejecting is simple and honest; queueing smooths bursts but adds latency and a new failure mode (unbounded queues). Bound any queue and shed load past it.</li>
+      </ul>
+
+      <h4>Scaling, failure &amp; cost</h4>
+      <p><strong>Scale:</strong> shard Redis by tenant key so the counter scales horizontally; the check is O(1). Estimate-then-reconcile keeps the hot path to a single atomic op.</p>
+      <p><strong>Failure:</strong> if Redis is unreachable, choose your failure mode deliberately — <em>fail-open</em> (admit, protect availability, risk overload) or <em>fail-closed</em> (reject, protect the backend, hurt availability). A local fallback bucket per server is a reasonable middle: degrade to approximate limiting rather than none. Clock skew across servers can mis-refill buckets; refill based on stored timestamps, not wall-clock deltas computed locally.</p>
+      <p><strong>Fairness &amp; cost:</strong> per-tenant buckets stop a noisy neighbor from consuming a shared pool; add a global ceiling so the sum of tenants cannot exceed backend capacity (backpressure). Surfacing <code>Retry-After</code> turns client retries from a thundering herd into orderly backoff, which is itself a cost and stability win.</p>
+
+      <h4>Likely follow-ups</h4>
+      <ul>
+        <li><em>Why limit tokens, not just requests, for an LLM API?</em> (Tokens are the scarce, variable-cost resource; request count hides 100× cost differences.)</li>
+        <li><em>Two API servers check the limit at the same instant. How do you avoid overselling?</em> (Atomic check-and-decrement in Redis via a Lua script.)</li>
+        <li><em>Redis is down. What happens?</em> (A deliberate fail-open or fail-closed choice, ideally with a local degraded fallback.)</li>
+      </ul>
+
+      <details class="quiz">
+        <summary>Why reserve the estimated token cost at admission and refund later, instead of just charging the actual tokens after the request finishes?</summary>
+        <div class="answer">
+          <p>If you only charge after completion, many large requests can all be admitted before any of them finishes — you learn you blew the limit only in hindsight, after the backend is already overwhelmed. Reserving the estimate (input + max output) at admission means the budget is debited <em>before</em> work starts, so concurrent big requests are correctly rejected once the bucket is empty. Refunding the unused portion afterward keeps tenants from being overcharged for reserving more than they used. Reserve-then-reconcile gives you both safety (never oversell) and fairness (never overcharge).</p>
+        </div>
+      </details>
+
+      <h2>How this shows up in the interview</h2>
+      <ul>
+        <li><strong>They will interrupt with a constraint mid-design.</strong> (<em>Now it must be multi-region.</em>) That is a test of whether your design has clean seams. Name what changes (the distributed counter, cache locality) and what does not.</li>
+        <li><strong>They will ask you to estimate cost out loud.</strong> Have the token-math reflex: input + output tokens × price × volume, then the biggest lever. Knowing prompt caching cuts repeated-prefix cost dramatically is a strong, specific signal.</li>
+        <li><strong>They will probe a failure mode you skipped.</strong> Pre-empt it: for every external call, say the timeout, the retry policy, and the fallback before they ask.</li>
+        <li><strong>They reward comparison, not assertion.</strong> Say <em>token bucket vs. sliding window</em>, <em>fail-open vs. fail-closed</em>, <em>Haiku for routing vs. Opus for hard steps</em> — and then commit to one with a reason.</li>
+      </ul>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>

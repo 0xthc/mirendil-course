@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P4 · RAG &amp; context management</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P4</div>
+      <h1>RAG &amp; context management</h1>
+      <p class="lede">A model ships knowing only what it saw during training — nothing about your company wiki, last night's support tickets, or the doc a user uploaded ten seconds ago. <strong>Retrieval-augmented generation (RAG)</strong> is how you hand the model the right facts at the right moment, and <strong>context management</strong> is how you keep that prompt from overflowing, going stale, or bankrupting you. This page is the playbook product engineers reach for first.</p>
+
+      <h2>Why RAG exists</h2>
+      <p>An LLM is a function over its <em>weights</em> (what it learned) plus its <em>context window</em> (what you put in the prompt right now). The weights are frozen at training time, so anything private, fresh, or proprietary is simply invisible to the model — it will either say it doesn't know or, worse, confidently make something up. You have three ways to fix that:</p>
+      <ul>
+        <li><strong>Fine-tune</strong> the weights on your data — expensive, slow to iterate, and it bakes knowledge in as of one moment, so it goes stale and is hard to update or cite.</li>
+        <li><strong>Stuff everything into the prompt</strong> — works only until your data is bigger than the context window, and you pay for every token on every call.</li>
+        <li><strong>Retrieve just the relevant pieces</strong> at query time and put <em>those</em> in the prompt — this is RAG. It's cheap, updates the instant your data changes, and lets you show <strong>citations</strong> so users (and you) can trust the answer.</li>
+      </ul>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Imagine an open-book exam. Fine-tuning is making the student memorize the whole textbook the night before — costly, and useless the moment the textbook is revised. RAG is letting the student walk in with the book and, for each question, flip to exactly the right page before answering. The student (the model) is the same; you just got very good at handing them the right page at the right time.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">The one-line definition</span>
+        <p>RAG = <strong>find the most relevant chunks of your data, paste them into the prompt, and ask the model to answer using only those chunks (with citations).</strong> Everything below is the engineering required to make "find the most relevant chunks" fast, accurate, and fresh.</p>
+      </div>
+
+      <h2>The pipeline, end to end</h2>
+      <p>RAG has two halves. <strong>Ingestion</strong> happens offline, ahead of time: you take your documents and turn them into a searchable index. <strong>Query time</strong> happens on every user request: you search that index and build a prompt. Here's ingestion first:</p>
+
+      <div class="diagram">
+        documents → <strong>chunk</strong> (split into passages) → <strong>embed</strong> (each chunk → a vector) → <strong>store</strong> (vector + text + metadata in an index)
+        <div class="cap">Ingestion runs once per document (and again whenever a document changes). The output is a vector index you can search by meaning.</div>
+      </div>
+
+      <p>Then, on every question the user asks, the query-time path runs:</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="One question through a RAG system"
+        data-sub="Click Next to follow a user question from raw text to a grounded, cited answer."
+        data-steps='[
+          {"op":"user query","shape":"How do I rotate an API key?","note":"Raw text from the user. The model has never seen your docs, so we cannot just ask it directly."},
+          {"op":"embed query","shape":"[1536-dim vector]","note":"Run the question through the same embedding model used at ingestion → a point in meaning-space."},
+          {"op":"similarity search","shape":"top-k = 20 chunks","note":"Find the nearest neighbors to the query vector in the index. These are the chunks most similar in meaning — your first-pass candidates."},
+          {"op":"rerank","shape":"top-k → top-5","note":"A heavier cross-encoder re-scores those 20 candidates against the actual query and keeps the 5 genuinely most relevant. Fixes retrieved-but-irrelevant."},
+          {"op":"augment prompt","shape":"system + 5 chunks + question","note":"Paste the surviving chunks into the prompt with their source IDs, plus an instruction: answer ONLY from these, cite sources, say you do not know otherwise."},
+          {"op":"generate + cite","shape":"grounded answer [doc 3]","note":"The model writes the answer using the provided chunks and tags each claim with the source it came from. Now the user can verify it."}
+        ]'
+        data-cap="The model only enters at the last step. Most of RAG quality is decided <strong>before</strong> the model ever runs — in retrieval and reranking."></div>
+
+      <h2>Embeddings &amp; vector search, in plain terms</h2>
+      <p>An <strong>embedding</strong> is a list of numbers (a vector, often a few hundred to a couple thousand of them) that represents the <em>meaning</em> of a piece of text. An embedding model is trained so that texts about similar things land near each other and texts about different things land far apart.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5 — the GPS pins</span>
+        <p>Think of every chunk of text as getting a GPS pin dropped on a giant map of meaning. "How do I reset my password?" and "I forgot my login credentials" get pins almost on top of each other, even though they share no words. "How do I bake bread?" gets a pin on the other side of the map. <strong>Searching is just: drop a pin for the question, then look for the nearest pins.</strong> Those nearby pins are the chunks most likely to answer it. That's vector search — nearest neighbors in meaning-space.</p>
+      </div>
+
+      <p>This is why RAG can find the right passage even when the user's words don't match the document's words at all — it's matching on meaning, not keywords. (Classic keyword search, like BM25, matches on words. The strongest systems often do <strong>both</strong> and merge the results — that's called hybrid search.)</p>
+
+      <p>The index that stores these vectors is a <strong>vector database</strong>. Its one job is: given a query vector, return the <span class="shape">k</span> nearest stored vectors, fast, even across millions of them. It does this with approximate-nearest-neighbor algorithms that trade a sliver of accuracy for enormous speed.</p>
+
+      <h2>Chunking: the decision that quietly makes or breaks you</h2>
+      <p>You can't embed a whole 50-page document as one vector — the meaning gets averaged into mush, and you'd have to paste all 50 pages into the prompt to use it. So you split documents into <strong>chunks</strong> (passages). Chunk size is a real tradeoff:</p>
+
+      <table>
+        <thead><tr><th>Chunk size</th><th>Upside</th><th>Downside</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Small</strong> (a sentence or two)</td><td>Precise — the matched chunk is tightly on-topic</td><td>Loses surrounding context; an answer split across two chunks gets cut in half</td></tr>
+          <tr><td><strong>Large</strong> (a full section)</td><td>Keeps context together; fewer chunks to manage</td><td>Dilutes the embedding; wastes prompt tokens on irrelevant text around the relevant bit</td></tr>
+        </tbody>
+      </table>
+
+      <p>Two techniques tame this. <strong>Overlap</strong>: let consecutive chunks share a bit of text (say the last sentence of one is the first of the next) so an idea that straddles a boundary isn't severed. <strong>Structure-aware splitting</strong>: cut on natural seams — headings, paragraphs, code blocks — instead of blindly every N characters, so each chunk is a coherent thought.</p>
+
+      <p>And attach <strong>metadata</strong> to every chunk: source document, title, author, date, section, access level. Metadata lets you <strong>filter before you search</strong> — "only retrieve from docs this user is allowed to see," "only the current product version," "only this customer's tickets." Metadata filtering is often the difference between a demo and a system that's safe in production.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha</span>
+        <p>Garbage retrieval produces <strong>confident, well-written, wrong answers</strong> — the most dangerous failure mode there is. If your chunks are split mid-sentence, your metadata lets a user retrieve another tenant's data, or your top-k is full of near-misses, the model will still fluently synthesize an answer from that junk and cite it. The model cannot tell good context from bad; it trusts whatever you hand it. <strong>Retrieval quality is the product.</strong> Spend your time there, not on prompt wording.</p>
+      </div>
+
+      <h2>Reranking: fixing "retrieved but irrelevant"</h2>
+      <p>Vector search is fast but approximate. It compares the query embedding to chunk embeddings that were each computed <em>in isolation, before your query existed</em>. So the top-k it returns are "in the right neighborhood," but the genuinely best answer might be ranked 14th while three near-misses sit at the top.</p>
+      <p>A <strong>reranker</strong> fixes this. It's a heavier model (a cross-encoder) that looks at the query and one candidate chunk <em>together</em> and scores how well that chunk actually answers <em>this</em> question. You can't afford to run it over a million chunks — but you can run it over the 20–50 candidates the vector search returned, then keep the true top 5. This two-stage pattern — cheap-and-broad retrieve, then expensive-and-precise rerank — is the standard recipe for high-quality RAG.</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Answer quality climbs with each stage (higher is better)"
+        data-sub="Illustrative: the share of questions answered correctly and fully grounded in sources."
+        data-groups='["Simple Q","Multi-fact Q","Obscure Q"]'
+        data-series='[{"name":"No RAG","color":"#f0986b","values":[55,28,8]},{"name":"RAG","color":"#57b6f5","values":[82,64,41]},{"name":"RAG + rerank","color":"#5fd38a","values":[90,81,67]}]'
+        data-unit="%"
+        data-ymax="100"
+        data-cap="No-RAG (orange) collapses on anything obscure or private — the model is guessing. Plain RAG (blue) is a huge jump. Adding a reranker (green) closes much of the remaining gap, especially on the hard multi-fact and long-tail questions where the right chunk was retrieved but buried."></div>
+
+      <h2>Citations, grounding &amp; cutting hallucination</h2>
+      <p>The reason RAG earns trust isn't just better answers — it's <strong>verifiable</strong> answers. When you paste chunks into the prompt, give each one a stable ID and instruct the model to cite the ID behind every claim, and to say "I don't know" if the chunks don't cover the question. This does three things:</p>
+      <ul>
+        <li><strong>Grounding</strong>: the model is told to answer from the provided text, not from its own fuzzy memory — sharply reducing hallucination.</li>
+        <li><strong>Verifiability</strong>: the user can click a citation and confirm it. Even a perfect answer is more useful when it's checkable.</li>
+        <li><strong>An escape hatch</strong>: "say you don't know if it isn't here" turns a confident wrong answer into an honest gap you can then go fix in your index.</li>
+      </ul>
+
+      <div class="callout warn">
+        <span class="label">Grounding is not a guarantee</span>
+        <p>Citations make hallucination far less likely, not impossible — a model can still misread a chunk or cite the wrong ID. Treat citations as something to <em>verify</em> in your evals (does the cited chunk actually support the claim?), not as a box you've checked. For high-stakes answers, surface the source text next to the answer so a human can confirm in one glance.</p>
+      </div>
+
+      <h2>Freshness &amp; invalidation</h2>
+      <p>Your index is a snapshot. The moment a document changes, its stored chunks and their embeddings are stale — and the model will happily cite the old version. So freshness is an explicit engineering job:</p>
+      <ul>
+        <li><strong>Re-embed on update</strong>: when a document changes, re-chunk it, re-embed the new chunks, and replace the old vectors. When it's deleted, delete its vectors — otherwise you'll cite a page that no longer exists.</li>
+        <li><strong>Track versions in metadata</strong>: stamp each chunk with a source version or timestamp so you can filter to "current only" and audit what was retrieved.</li>
+        <li><strong>Watch the embedding model itself</strong>: if you ever switch embedding models, every vector in your index was computed by the old one and is no longer comparable. You must re-embed the <em>entire</em> corpus. Query and index must always share one embedding model.</li>
+      </ul>
+
+      <h2>Context management: when the window fills up</h2>
+      <p>RAG is one source of prompt content; a long conversation is another. Both compete for a finite <strong>context window</strong>, and a longer prompt means <strong>more cost and more latency on every single turn</strong> — you pay for all those tokens to be processed each time (this ties straight back to P1: tokens are the unit of both the bill and the wait). So managing what's in the window is a core product skill. Your levers:</p>
+
+      <table>
+        <thead><tr><th>Strategy</th><th>What it does</th><th>Best when</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Summarize</strong> old turns</td><td>Replace the first N messages with a short running summary the model maintains</td><td>Long chats where early detail still matters in spirit but not verbatim</td></tr>
+          <tr><td><strong>Prune / window</strong></td><td>Drop the oldest turns entirely, keep the last few plus the system prompt</td><td>Chats where only recent context is relevant (most assistants)</td></tr>
+          <tr><td><strong>Retrieve on demand</strong></td><td>Store history (or docs) in a vector index and pull back only the pieces relevant to the current turn</td><td>Huge histories or knowledge bases — this is RAG applied to the conversation itself</td></tr>
+        </tbody>
+      </table>
+
+      <p>These compose. A mature assistant keeps a system prompt, a rolling summary of the distant past, the last few raw turns verbatim, and retrieves older specifics only when the current question needs them. And remember <strong>prompt caching</strong> (P1): keep the stable part of your prompt — system instructions, long reference docs — at the <em>front</em> and unchanged, so the model can cache it and you stop paying full price to re-read it every turn. Order your context cache-friendly: static first, dynamic last.</p>
+
+      <div class="callout key">
+        <span class="label">More context is not free, and not always better</span>
+        <p>Two reasons to resist the urge to "just stuff in more." First, <strong>cost and latency scale with tokens</strong> — a bloated window taxes every turn. Second, <strong>quality can drop</strong>: models attend less reliably to material buried in the middle of a very long prompt (the "lost in the middle" effect). A tight, well-retrieved, well-ordered prompt usually beats a giant one. Curate the window; don't just fill it.</p>
+      </div>
+
+      <h2>Evaluating retrieval quality</h2>
+      <p>Since retrieval decides almost everything, you have to measure it — separately from the final answer, so you know <em>which half</em> to fix. The core retrieval metrics:</p>
+      <ul>
+        <li><strong>Recall@k</strong>: of all the chunks that <em>should</em> have been retrieved for a question, what fraction showed up in your top-k? Low recall@k means the right answer never even made it into the prompt — no reranker or clever wording can save you.</li>
+        <li><strong>Precision@k / relevance</strong>: of the k chunks you retrieved, how many are actually relevant? Low precision means you're wasting prompt tokens (and risking distraction) on junk.</li>
+        <li><strong>MRR / nDCG</strong>: did the best chunk land near the <em>top</em>, not just somewhere in the list? This is what a reranker is meant to improve.</li>
+      </ul>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Recall@k — how many true answers make the cut as k grows"
+        data-sub="Illustrative: fraction of questions whose correct chunk is somewhere in the top-k, before vs after reranking."
+        data-groups='["k=1","k=3","k=5","k=10","k=20"]'
+        data-series='[{"name":"Vector only","color":"#57b6f5","values":[42,63,72,84,91]},{"name":"Vector + rerank","color":"#5fd38a","values":[61,80,88,93,95]}]'
+        data-unit="%"
+        data-ymax="100"
+        data-cap="Recall rises with k — retrieve more candidates and you are more likely to catch the right one. But you cannot stuff k=20 into the prompt cheaply, so you retrieve broad (high k), then rerank down to a few. Reranking (green) lifts recall at every small k — the right chunk lands near the top, where it fits in the prompt."></div>
+
+      <p>Then evaluate the <strong>answer</strong> on top of retrieval: is it correct, is it actually grounded in the cited chunks (faithfulness), did it cite the right sources? A common, scalable approach is an LLM-as-judge over a fixed test set of question/answer/source triples — which is exactly where P5 picks up.</p>
+
+      <h2>How this shows up in the interview</h2>
+
+      <h3>“Design a RAG system for a company's internal docs.”</h3>
+      <p>Walk both halves of the pipeline and name the tradeoffs. <strong>Ingestion</strong>: structure-aware chunking with overlap; embed with a single chosen model; store vectors plus rich metadata (source, date, <em>access level</em>, version) in a vector index; re-embed on document change, delete on removal. <strong>Query time</strong>: embed the query, <em>filter by the user's permissions first</em>, retrieve top-20 (consider hybrid keyword + vector), rerank to top-5, build a prompt that says "answer only from these chunks, cite IDs, say you don't know otherwise," generate. Then volunteer the cross-cutting concerns: <strong>access control via metadata filtering</strong> (the answer that separates senior from junior — you must not retrieve docs the user can't see), <strong>freshness</strong>, <strong>citations for trust</strong>, and an <strong>eval harness</strong> tracking recall@k and faithfulness so you can iterate. Mention that retrieval quality, not prompt wording, is where the wins are.</p>
+
+      <h3>“The context window fills up mid-conversation. What do you do?”</h3>
+      <p>Name the three levers and when each applies: <strong>summarize</strong> the distant past into a rolling summary, <strong>prune</strong> the oldest turns when only recency matters, and <strong>retrieve on demand</strong> from a history index for very long sessions. Say they compose: system prompt + rolling summary + last few raw turns + retrieved specifics. Then connect it to the business: longer context means more cost and latency every turn (P1), and quality can actually <em>drop</em> on bloated prompts ("lost in the middle"), so the goal is a tight, well-ordered window — not a full one. Bonus points for ordering the stable content first so <strong>prompt caching</strong> kicks in.</p>
+
+      <h3>“How would you measure and improve retrieval quality?”</h3>
+      <p>Separate retrieval from generation so you know what to fix. Build a labeled test set (questions with their known-correct source chunks). Measure <strong>recall@k</strong> (did the right chunk make it into the candidates at all?) and <strong>precision/relevance</strong> and ranking metrics like <strong>MRR/nDCG</strong> (did it land near the top?). Diagnose: low recall@k → fix chunking, the embedding model, or add hybrid search; good recall but the right chunk ranked low → add or tune a <strong>reranker</strong>; good retrieval but bad answers → it's a generation/grounding problem, fix the prompt or use faithfulness checks. Close the loop with an answer-level eval (correctness + faithfulness, often LLM-as-judge) on a fixed set so every change is measured, not guessed — which is exactly P5.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>A user asks about a feature documented only in a page added this morning, and the assistant gives a confident but completely wrong answer with no citation. Where do you look first?</summary>
+        <div class="answer">
+          <p><strong>Retrieval and freshness, not the model.</strong> A confident wrong answer with no usable source is the classic "garbage retrieval" signature — the right chunk almost certainly never made it into the prompt. Check: was this morning's page actually ingested and embedded yet (freshness/invalidation)? If it was, is recall@k catching it, or is it ranked below the cutoff (a reranking or chunking problem)? The generation step did its job with bad inputs. Fix the inputs.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Why retrieve top-20 and then rerank down to 5, instead of just retrieving the top 5 directly from the vector search?</summary>
+        <div class="answer">
+          <p>Because vector search is fast but approximate — it scores chunks by embeddings computed before your query existed, so the genuinely best chunk can sit at rank 12 while near-misses fill the top 5. Retrieving a broad top-20 gives you high <strong>recall</strong> (the right chunk is very likely <em>somewhere</em> in there). The reranker then looks at the query and each candidate <em>together</em> and re-scores precisely, surfacing the true best few. Cheap-and-broad then expensive-and-precise: you get the recall of a big k with a prompt small enough to afford.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>Your conversation has gone 60 turns and every new reply is getting slower and more expensive. The full history is in the prompt. What's happening and what are your options?</summary>
+        <div class="answer">
+          <p>Cost and latency scale with prompt tokens, and you're re-sending the entire growing history every turn (P1). Options, often combined: <strong>summarize</strong> the early turns into a compact running summary; <strong>prune</strong> the oldest turns if only recent context matters; or <strong>retrieve on demand</strong> from a history index so only the relevant past turns come back. Also keep the stable system prompt at the front so <strong>prompt caching</strong> avoids re-billing it. And don't assume more context is better — buried middle content gets attended to less reliably anyway.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>You switch to a newer, better embedding model. What must you do to your existing vector index, and why?</summary>
+        <div class="answer">
+          <p>Re-embed the <strong>entire corpus</strong>. Every stored vector was produced by the old model, and vectors from different embedding models live in different, incomparable spaces — a query embedded by the new model can't be meaningfully compared to chunks embedded by the old one, so nearest-neighbor results become garbage. The query and the index must always share one embedding model. (This is also why "just upgrade the embedder" is never a free change in production.)</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>
