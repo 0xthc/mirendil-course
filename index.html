@@ -76,9 +76,39 @@
         </a>
       </div>
 
+      <h2 style="border:none;margin-top:48px">Runnable notebooks</h2>
+      <p class="lede" style="font-size:17px">The companion <strong>marimo notebooks</strong> — execute every idea, with live charts and correctness checks. These are rendered snapshots (all charts &amp; outputs visible); for the live sliders, run them locally with <code>uv run marimo edit notebooks/…</code>.</p>
+      <div class="module-cards">
+        <a class="module-card" href="notebooks/01_transformers.html">
+          <span class="mnum">NOTEBOOK 01</span>
+          <div class="mttl">How a transformer computes</div>
+          <p class="mdesc">Build embeddings, the residual stream, and the MLP in real torch. Param/activation counting with live charts.</p>
+        </a>
+        <a class="module-card" href="notebooks/02_attention.html">
+          <span class="mnum">NOTEBOOK 02</span>
+          <div class="mttl">Attention from scratch</div>
+          <p class="mdesc">Scores → causal mask → softmax → multi-head, with heatmaps. Verified against PyTorch's SDPA.</p>
+        </a>
+        <a class="module-card" href="notebooks/03_tensor_parallelism.html">
+          <span class="mnum">NOTEBOOK 03</span>
+          <div class="mttl">Tensor parallelism, simulated</div>
+          <p class="mdesc">Column/row sharding across simulated ranks, all_reduce, proven equal to a single-process reference.</p>
+        </a>
+        <a class="module-card" href="notebooks/04_sequence_parallelism.html">
+          <span class="mnum">NOTEBOOK 04</span>
+          <div class="mttl">Sequence parallelism, simulated</div>
+          <p class="mdesc">Token sharding, K/V all_gather, the causal-offset mask, and the load-imbalance / zigzag chart.</p>
+        </a>
+        <a class="module-card" href="notebooks/05_tensor_sequence_parallelism.html">
+          <span class="mnum">NOTEBOOK 05</span>
+          <div class="mttl">Tensor-sequence parallelism, simulated</div>
+          <p class="mdesc">The folded loop algorithm, verified correct, plus the real benchmark memory/latency charts.</p>
+        </a>
+      </div>
+
       <div class="callout analogy" style="margin-top:32px">
         <span class="label">How to use this</span>
-        <p>Read in order — each module assumes the previous one. When a module references a file like <code>tensor_parallelism.py</code>, that's real code sitting next to this course in the repo; open it side by side once you've read the concept. You don't need a GPU to follow along.</p>
+        <p>Read in order — each module assumes the previous one. When a module references a file like <code>tensor_parallelism.py</code>, that's real code sitting next to this course in the repo; open it side by side once you've read the concept. You don't need a GPU to follow along. The notebooks above let you actually run and tinker with each concept (multi-GPU is simulated on CPU).</p>
       </div>
     </div>
   </main>
