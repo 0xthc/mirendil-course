@@ -26,6 +26,7 @@ const SECTIONS = [
     title: "Track 2 · Building with models",
     pages: [
       { file: "p1-inference.html",        num: "P1", title: "Inference, latency & cost" },
+      { file: "p1b-kv-cache.html",        num: "P1.5", title: "KV cache & prompt caching (deep)" },
       { file: "p2-talking-to-models.html", num: "P2", title: "Talking to models in production" },
       { file: "p3-agents.html",           num: "P3", title: "Agents" },
       { file: "p4-rag.html",              num: "P4", title: "RAG & context management" },

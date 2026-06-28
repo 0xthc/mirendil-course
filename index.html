@@ -85,6 +85,11 @@
           <div class="mttl">Inference, latency & cost</div>
           <p class="mdesc">Prefill vs decode, the KV cache, why output tokens & long context drive cost and latency, and prompt caching. With a live cost calculator.</p>
         </a>
+        <a class="module-card" href="p1b-kv-cache.html">
+          <span class="mnum">P1.5</span>
+          <div class="mttl">KV cache & prompt caching (deep)</div>
+          <p class="mdesc">A deep dive: how the KV cache turns O(n²) generation into O(n), why it bounds memory & throughput, and how prompt caching reuses it across requests — with the real cache_control rules, TTLs, and break-even math.</p>
+        </a>
         <a class="module-card" href="p2-talking-to-models.html">
           <span class="mnum">P2</span>
           <div class="mttl">Talking to models in production</div>
@@ -184,6 +189,11 @@
           <span class="mnum">NOTEBOOK 09</span>
           <div class="mttl">Latency & cost model</div>
           <p class="mdesc">The math of inference cost: output tokens vs input, prefill vs decode, prompt caching — with interactive sliders.</p>
+        </a>
+        <a class="module-card" href="notebooks/10_kv_cache.html">
+          <span class="mnum">NOTEBOOK 10</span>
+          <div class="mttl">KV cache & prompt caching</div>
+          <p class="mdesc">Toy attention with vs without a KV cache (watch O(n²) become O(n)), plus an interactive prompt-caching cost/break-even simulator.</p>
         </a>
       </div>
 

@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P1.5 · KV cache &amp; prompt caching (deep)</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Track 2 · Building with models · P1.5</div>
+      <h1>KV cache &amp; prompt caching (deep)</h1>
+      <p class="lede">Two things share the word “cache” and get conflated constantly, including in interviews. The <strong>KV cache</strong> is the engine&rsquo;s private scratchpad inside one request. <strong>Prompt caching</strong> is an API feature you control to reuse work across requests. They are the same kind of object — a saved prefill state — living on two different timescales. This page pulls them fully apart, then shows exactly how they connect.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Imagine the model is a chef. To cook your dish it first reads the whole recipe and lays out every ingredient on the counter — that prep is the <strong>KV cache</strong>: it exists only while this one dish is being cooked, and it gets thrown out when the plate goes out. Now imagine ten customers all order the same base sauce. <strong>Prompt caching</strong> is the chef saying &ldquo;keep that base sauce warm on the side&rdquo; so the next order skips the prep entirely. Same prepped ingredients — one is for the dish in front of you, the other is kept around for the next customer.</p>
+      </div>
+
+      <h2>The one table that disambiguates them</h2>
+      <p>If you remember nothing else, remember this contrast. Almost every confusion about caching dissolves once you separate <em>within one request</em> from <em>across requests</em>.</p>
+
+      <table>
+        <thead><tr><th></th><th>KV cache</th><th>Prompt caching</th></tr></thead>
+        <tbody>
+          <tr><td><strong>What it is</strong></td><td>The inference engine&rsquo;s internal scratchpad.</td><td>An API feature you opt into.</td></tr>
+          <tr><td><strong>Scope</strong></td><td>One single request.</td><td>Across many requests.</td></tr>
+          <tr><td><strong>Lifetime</strong></td><td>The duration of the request, then freed.</td><td>A TTL — minutes to an hour.</td></tr>
+          <tr><td><strong>Who controls it</strong></td><td>Automatic and invisible; you cannot touch it.</td><td>You, via <code>cache_control</code> on a content block.</td></tr>
+          <tr><td><strong>What it stores</strong></td><td>The keys &amp; values for every past token, at every layer.</td><td>The computed prefill state (which <em>is</em> a KV cache) of a stable prefix.</td></tr>
+          <tr><td><strong>Why it exists</strong></td><td>Turn O(n&sup2;) decode into O(n).</td><td>Stop re-paying to prefill identical text.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout key">
+        <span class="label">The punchline</span>
+        <p>Prompt caching is literally &ldquo;<strong>save the KV cache produced by a previous request&rsquo;s prefill, and reuse it.</strong>&rdquo; The KV cache is the object; prompt caching is the policy that lets that object outlive the one request that built it. Different lifetime, same thing.</p>
+      </div>
+
+      <h2 id="part1">Part 1 — The KV cache (the mechanism)</h2>
+
+      <h3>Why it has to exist</h3>
+      <p>Generation is sequential: the model writes one output token, then the next, each one a full forward pass. To produce a token, the attention mechanism has every position&rsquo;s <em>query</em> attend against the <em>keys</em> and <em>values</em> of all earlier tokens. Here is the crucial observation: when you append a new token, the keys and values of all the <em>earlier</em> tokens do not change. They are a function of tokens that are already fixed. So recomputing them on every step would redo the same work over and over — O(n&sup2;) per layer across the whole generation.</p>
+      <p>The fix is to compute each token&rsquo;s K and V exactly once and keep them. After a token is processed, its keys and values are written into the <strong>KV cache</strong>. Each new step then computes only the K/V for the <em>one</em> new token and attends against everything already saved. That turns the per-token cost from &ldquo;reprocess the whole sequence&rdquo; into &ldquo;process one token,&rdquo; making total decode O(n) instead of O(n&sup2;).</p>
+
+      <h3>How it ties to prefill vs decode</h3>
+      <p>This maps cleanly onto the two phases of a request:</p>
+      <ul>
+        <li><strong>Prefill</strong> reads the prompt and <em>populates</em> the cache. All prompt tokens go through in parallel, so it is compute-bound and fast per token.</li>
+        <li><strong>Decode</strong> generates the answer and <em>reads</em> the whole cache on every single output token. Each step reads all the weights plus the entire KV cache out of memory to produce one token, so it is memory-bandwidth-bound.</li>
+      </ul>
+      <p>That asymmetry is exactly why output tokens dominate latency: each one is a separate sequential pass that drags the full, growing cache through memory.</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="One request, watching the KV cache fill"
+        data-sub="Click Next: prefill populates the cache, then each decode step appends exactly one row."
+        data-steps='[
+          {"op":"prompt arrives","shape":"1,500 input tokens","note":"System prompt, tools, context, and the user question. Nothing computed yet; the KV cache is empty."},
+          {"op":"PREFILL — process the whole prompt","shape":"cache = 1,500 rows","note":"All prompt tokens go through together in one parallel, compute-bound pass. Their K and V are written into the cache for every layer."},
+          {"op":"first token emitted","shape":"TTFT","note":"Time to first token. The model reads the freshly built cache and produces output token #1. This is the moment prefill ends and decode begins."},
+          {"op":"DECODE step — generate one token","shape":"cache = 1,501 rows","note":"Compute K/V for the single new token, append it to the cache, attend over everything saved, emit one token. Memory-bandwidth-bound."},
+          {"op":"DECODE loop — repeat","shape":"cache grows by 1 each step","note":"Every output token is its own sequential forward pass that reads all weights + the whole (now larger) cache. This loop is where the wall-clock time lives."},
+          {"op":"stop condition","shape":"EOS or max_tokens","note":"The loop ends at an end-of-sequence token or the output cap. The reply is complete and this request&rsquo;s KV cache is freed immediately."}
+        ]'
+        data-cap="Prefill builds the cache in one shot; decode reads the whole thing every token and appends one row. The cache lives and dies with this single request."></div>
+
+      <h3>How big is it? The size math</h3>
+      <p>The cache stores a key and a value for every token, at every layer, for every KV head. The formula:</p>
+      <div class="diagram">
+        <p><code>kv_bytes = 2 &times; n_layers &times; n_kv_heads &times; head_dim &times; seq_len &times; bytes_per_value</code></p>
+        <div class="cap">The leading 2 is for storing both K and V. <code>bytes_per_value</code> is 2 for bf16.</div>
+      </div>
+      <p>Worked example. Take a model with <span class="shape">32 layers</span>, <span class="shape">8 KV heads</span>, <span class="shape">head_dim 128</span>, in bf16:</p>
+      <div class="diagram">
+        <p><code>2 &times; 32 &times; 8 &times; 128 &times; 2 bytes = 131,072 bytes per token &asymp; 131 KB/token</code></p>
+        <p>&times; 8,000 tokens &asymp; <strong>1 GB</strong> &nbsp;&middot;&nbsp; &times; 128,000 tokens &asymp; <strong>16 GB</strong></p>
+        <div class="cap">And that is for ONE request. A single 128K-context conversation can hold ~16 GB of KV cache resident on the GPU for its entire lifetime.</div>
+      </div>
+
+      <div class="viz" data-viz="barchart"
+        data-title="KV cache size vs sequence length (one request)"
+        data-sub="Same model as above: 32 layers, 8 KV heads, head_dim 128, bf16 (~131 KB/token). It scales linearly with context."
+        data-groups='["8K","32K","64K","128K"]'
+        data-series='[{"name":"KV cache (GB)","color":"#c099f0","values":[1.05,4.19,8.39,16.78]}]'
+        data-unit=" GB"
+        data-cap="Linear in context length. Because this memory is resident for the whole request, a few long-context conversations can consume more GPU memory than the model weights themselves."></div>
+
+      <h3>Why it bounds throughput</h3>
+      <p>GPU memory is finite, and the KV cache competes with the model weights for it. Whatever is left after the weights determines how many requests&rsquo; caches can be resident at once — and that is your batch size, which is your throughput. Long context multiplied by batch size caps how many concurrent requests you can serve.</p>
+      <p>This is why <strong>GQA / MQA</strong> matter so much. They shrink <code>n_kv_heads</code>: many query heads share a smaller set of KV heads. A model with 32 query heads but only 8 KV heads has a cache about <strong>4&times; smaller</strong> than if every query head had its own KV head — directly buying back batch size and longer usable context.</p>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha</span>
+        <p>&ldquo;Long context&rdquo; is not just a token bill. It is expensive three ways at once: <strong>compute</strong> (more to prefill), <strong>memory</strong> (a bigger KV cache resident for the whole request), and <strong>throughput</strong> (that memory is no longer available to hold anyone else&rsquo;s request). When you double a context window you are quietly deciding how many <em>other</em> users you can serve.</p>
+      </div>
+
+      <h2 id="part2">Part 2 — Prompt caching (the API feature)</h2>
+      <p>Now the thing you actually control. Prompt caching persists the prefill KV state of a stable prefix so that later requests reuse it instead of recomputing it — much cheaper, and faster TTFT.</p>
+
+      <h3>How you turn it on</h3>
+      <p>Add <code>cache_control</code> to a content block. The block (and everything before it) becomes a cacheable prefix:</p>
+      <ul>
+        <li><code>{&quot;type&quot;:&quot;ephemeral&quot;}</code> &mdash; 5-minute TTL (the default), <strong>refreshed on every hit</strong>, so a busy prefix stays warm.</li>
+        <li><code>{&quot;type&quot;:&quot;ephemeral&quot;,&quot;ttl&quot;:&quot;1h&quot;}</code> &mdash; 1-hour TTL.</li>
+      </ul>
+
+      <div class="callout key">
+        <span class="label">The one rule that governs everything</span>
+        <p>Prompt caching is a <strong>prefix match</strong>. Any byte change <em>anywhere</em> in the prefix invalidates the cache for everything after that point. The render order is <strong>tools &rarr; system &rarr; messages</strong>. So put stable content first and volatile content (timestamps, the user&rsquo;s question, per-request IDs) last. Order is the whole game.</p>
+      </div>
+
+      <h3>The numbers that matter</h3>
+      <table>
+        <thead><tr><th>Fact</th><th>Value</th></tr></thead>
+        <tbody>
+          <tr><td>Breakpoints per request</td><td>Max <strong>4</strong> (on system / tool / message / document / image blocks).</td></tr>
+          <tr><td>Cache <strong>read</strong> price</td><td>&asymp; <strong>0.1&times;</strong> base input (~90% off).</td></tr>
+          <tr><td>Cache <strong>write</strong> price</td><td><strong>1.25&times;</strong> for 5-min TTL, <strong>2&times;</strong> for 1-hour TTL.</td></tr>
+          <tr><td>Break-even</td><td>~<strong>2</strong> requests for 5-min TTL; ~<strong>3</strong> for 1-hour.</td></tr>
+          <tr><td>Minimum cacheable prefix</td><td><strong>4096</strong> tokens (Opus 4.8/4.7/4.6/4.5, Haiku 4.5); <strong>2048</strong> (Sonnet 4.6, Haiku 3.5/3); <strong>1024</strong> (Sonnet 4.5/4.1/4/3.7).</td></tr>
+          <tr><td>Below the minimum</td><td>It <strong>silently</strong> does not cache — no error.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Why the write premium still pays off</h3>
+      <p>The first request <em>writes</em> the cache at 1.25&times;, so a single call is slightly more expensive than not caching. Every later call with the same prefix <em>reads</em> at ~0.1&times;. On a large shared prefix the crossover comes almost immediately — by the second request you are already ahead.</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Cumulative cost: uncached vs prompt-cached"
+        data-sub="A large shared prefix (normalized to 10 units of base input), 5-min TTL. Write = 1.25&times; on request 1; each later read = 0.1&times;."
+        data-groups='["1 request","2 requests","5 requests","10 requests"]'
+        data-series='[{"name":"Uncached","color":"#f0986b","values":[10,20,50,100]},{"name":"Prompt-cached","color":"#5fd38a","values":[12.5,13.5,16.5,21.5]}]'
+        data-cap="At 1 request the cache costs slightly more (12.5 vs 10 — you paid the 1.25&times; write). By 2 requests it has already crossed over (13.5 vs 20), and by 10 it is ~5&times; cheaper. This is the ~2-request break-even, made visible."></div>
+
+      <h3>Verify it actually works</h3>
+      <p>The response <code>usage</code> object tells you exactly what happened. Three fields:</p>
+      <ul>
+        <li><code>cache_creation_input_tokens</code> &mdash; tokens just <em>written</em> to the cache (billed at the write rate).</li>
+        <li><code>cache_read_input_tokens</code> &mdash; tokens <em>served from</em> the cache (billed ~0.1&times;).</li>
+        <li><code>input_tokens</code> &mdash; ordinary uncached input.</li>
+      </ul>
+      <p>If <code>cache_read_input_tokens</code> stays <strong>0</strong> across requests that should share a prefix, you have a silent invalidator somewhere in that prefix. That number is your single best debugging signal.</p>
+
+      <pre><code><span class="tok-key">import</span> anthropic
+client = anthropic.Anthropic()
+
+STABLE = <span class="tok-str">&quot;...your long, byte-stable system prompt (&gt;= the model minimum)...&quot;</span>
+
+resp = client.messages.create(
+    model=<span class="tok-str">&quot;claude-opus-4-8&quot;</span>,
+    max_tokens=<span class="tok-num">512</span>,
+    system=[{
+        <span class="tok-str">&quot;type&quot;</span>: <span class="tok-str">&quot;text&quot;</span>,
+        <span class="tok-str">&quot;text&quot;</span>: STABLE,
+        <span class="tok-str">&quot;cache_control&quot;</span>: {<span class="tok-str">&quot;type&quot;</span>: <span class="tok-str">&quot;ephemeral&quot;</span>},   <span class="tok-com"># 5-min TTL breakpoint</span>
+    }],
+    messages=[{<span class="tok-str">&quot;role&quot;</span>: <span class="tok-str">&quot;user&quot;</span>, <span class="tok-str">&quot;content&quot;</span>: user_question}],  <span class="tok-com"># volatile: goes last</span>
+)
+
+<span class="tok-com"># First call writes; identical-prefix calls after it read.</span>
+<span class="tok-fn">print</span>(resp.usage.cache_creation_input_tokens)  <span class="tok-com"># &gt; 0 on the write</span>
+<span class="tok-fn">print</span>(resp.usage.cache_read_input_tokens)      <span class="tok-com"># &gt; 0 on every hit</span></code></pre>
+
+      <h3>The silent killers</h3>
+      <div class="callout gotcha">
+        <span class="label">Gotcha</span>
+        <p>Most &ldquo;prompt caching does nothing&rdquo; reports are a volatile byte sitting inside the prefix. The classic culprit is a <code>datetime.now()</code> or a fresh <code>uuid</code> in the system prompt — it changes every request, so the prefix never matches and you re-prefill every time. Watch <code>cache_read_input_tokens</code>: if it is stuck at 0, hunt for the moving byte.</p>
+      </div>
+
+      <table>
+        <thead><tr><th>Mistake</th><th>What happens</th><th>Fix</th></tr></thead>
+        <tbody>
+          <tr><td>Timestamp / UUID / request-id in the system prompt</td><td>Prefix differs every call &rarr; 0 hits.</td><td>Move volatile values to the end, after the breakpoint.</td></tr>
+          <tr><td>Non-deterministic JSON (no <code>sort_keys</code>, iterating a set)</td><td>Byte order varies &rarr; prefix mismatch.</td><td>Serialize deterministically (sorted keys, ordered structures).</td></tr>
+          <tr><td>Changing <em>tools</em> mid-conversation</td><td>Tools render at position 0 &rarr; invalidates <strong>everything</strong>.</td><td>Keep the tool set fixed for the life of the cache.</td></tr>
+          <tr><td>Switching the model mid-conversation</td><td>Caches are model-scoped &rarr; full miss.</td><td>Pin one model per cached conversation.</td></tr>
+          <tr><td>Toggling <code>tool_choice</code> or <code>thinking</code></td><td><strong>Does NOT</strong> drop the tools+system cache (tiered invalidation).</td><td>Safe — these are fine to vary.</td></tr>
+          <tr><td>Very long agentic turns</td><td>Only a ~20-block lookback window is checked for cache hits.</td><td>Add an intermediate breakpoint every ~15 blocks.</td></tr>
+          <tr><td>Concurrent fan-out from a cold cache</td><td>An entry is only readable after the first response <em>begins streaming</em>.</td><td>Fire one request, await its first token, then fan out the rest.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>Where it wins</h3>
+      <ul>
+        <li><strong>A long, stable system prompt</strong> shared across many users — cache it once, every user reads it.</li>
+        <li><strong>One long document, many questions</strong> — document before the breakpoint, the question after it.</li>
+        <li><strong>RAG context</strong> that is reused across a session.</li>
+        <li><strong>Multi-turn chat</strong> — put the breakpoint on the last turn so the growing history stays cached.</li>
+        <li><strong>Agent loops</strong> — the identical tools + system prompt are re-sent on every step; caching makes each step cheap.</li>
+      </ul>
+
+      <h2 id="part3">Part 3 — How they connect</h2>
+      <p>Now the whole picture in one frame. They are the same object on two timescales:</p>
+      <table>
+        <thead><tr><th></th><th>KV cache</th><th>Prompt caching</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Timescale</strong></td><td>Within one request.</td><td>Across requests.</td></tr>
+          <tr><td><strong>What it buys</strong></td><td>O(n&sup2;) &rarr; O(n) decode.</td><td>Skip re-prefilling a stable prefix (~0.1&times; to reuse).</td></tr>
+          <tr><td><strong>Control</strong></td><td>Automatic, invisible.</td><td>You, via <code>cache_control</code>; TTL&rsquo;d.</td></tr>
+          <tr><td><strong>The object</strong></td><td colspan="2" style="text-align:center"><strong>The same prefill KV state</strong> — prompt caching just persists it past the one request that built it.</td></tr>
+        </tbody>
+      </table>
+      <p>So: the engine always builds a KV cache to make a single request fast. Prompt caching is you telling the provider &ldquo;don&rsquo;t throw that prefill away when this request ends — keep it for the next one that starts with the same bytes.&rdquo;</p>
+
+      <h2>How this shows up in the interview</h2>
+      <p>This is a favorite because it separates people who have shipped on models from people who have only read about them. Expect these.</p>
+
+      <div class="callout key">
+        <span class="label">Q: Why is long context expensive?</span>
+        <p>Three mechanisms, all flowing from the KV cache. <strong>Compute:</strong> a longer prompt is more prefill work. <strong>Memory:</strong> the KV cache grows linearly with context (~131 KB/token for a 32-layer/8-KV-head/bf16 model &mdash; ~16 GB at 128K) and is resident for the whole request. <strong>Throughput:</strong> that resident memory competes with the weights and with every other request&rsquo;s cache, so long context shrinks batch size and the number of concurrent users you can serve. Long context costs latency <em>and</em> memory <em>and</em> who else you can serve.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">Q: Cut cost on a chatbot with a 10K-token system prompt.</span>
+        <p>Prompt caching, breakpoint on the system block. The 10K tokens easily clear every model minimum, so put a <code>cache_control</code> ephemeral breakpoint there, keep that prefix <strong>byte-stable</strong> (no timestamps/UUIDs — those go after the breakpoint), and pin one model. Then verify: watch <code>cache_read_input_tokens</code> climb on repeat calls. Cached reads at ~0.1&times; mean the system prompt goes from full price every turn to roughly a tenth, with break-even after about the second request. If <code>cache_read</code> stays 0, a volatile byte slipped into the prefix.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">Q: KV cache vs prompt caching — one line each.</span>
+        <p><strong>KV cache:</strong> the engine&rsquo;s automatic, per-request scratchpad that makes decode O(n) instead of O(n&sup2;). <strong>Prompt caching:</strong> an API feature that persists a request&rsquo;s prefill KV state for a stable prefix so later requests reuse it at ~0.1&times;. Same object, different lifetime.</p>
+      </div>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>You enable prompt caching on a 6K-token system prompt for an Opus 4.8 chatbot, but <code>cache_read_input_tokens</code> is always 0. The prefix is above the 4096-token minimum. What is most likely wrong?</summary>
+        <div class="answer">
+          <p>A volatile byte inside the prefix. Prompt caching is a prefix match, so anything that changes per request — a <code>datetime.now()</code>, a session UUID, a request id, or non-deterministically serialized JSON — invalidates everything after it, and the cache never gets a hit. Move all volatile content after the breakpoint (render order is tools &rarr; system &rarr; messages), serialize JSON deterministically, and confirm the model and tool set are not changing mid-conversation. The 0 in <code>cache_read</code> is the tell.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>A model has 32 query heads but only 8 KV heads (GQA). How does that change the KV cache, and why does it matter for serving?</summary>
+        <div class="answer">
+          <p>The cache size depends on <code>n_kv_heads</code>, not <code>n_query_heads</code>. With 8 KV heads instead of 32, the cache is about 4&times; smaller than full multi-head attention would be. Since the KV cache competes with the weights for GPU memory and caps how many requests fit in a batch, a 4&times; smaller cache directly buys back batch size (throughput) and longer usable context. That is the entire point of GQA/MQA.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>For a single one-off API call with a large prefix, prompt caching makes it slightly more expensive, not cheaper. Why — and when does it flip?</summary>
+        <div class="answer">
+          <p>The first call has to <em>write</em> the cache, billed at 1.25&times; base input (for the 5-min TTL), so a lone request pays a premium over not caching at all. The savings come from later reads at ~0.1&times;. With a large shared prefix the crossover lands at about the second request (5-min TTL; ~3 for the 1-hour TTL). One-and-done calls should not bother; anything repeated should.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>
