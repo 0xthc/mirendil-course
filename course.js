@@ -36,6 +36,12 @@ const SECTIONS = [
     ],
   },
   {
+    title: "Capstone · End-to-end",
+    pages: [
+      { file: "capstone-system-design.html", num: "C1", title: "A chat platform: HTTP → attention" },
+    ],
+  },
+  {
     title: "Interview prep",
     pages: [
       { file: "iv-questions.html",      num: "IV", title: "Question bank" },

@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Capstone · A chat platform: HTTP → attention</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div class="layout">
+  <main class="content">
+    <div class="content-inner">
+      <div class="eyebrow">Capstone · End-to-end</div>
+      <h1>A chat platform: HTTP &rarr; attention</h1>
+      <p class="lede">This is the whole stack in one page. We design a Claude.ai-style threads product &mdash; users create threads, type a message, watch a reply stream back token by token &mdash; and then we follow a single request all the way down: from the <code>POST</code> that leaves the browser, through the edge, the gateway, the services and their data stores, into a GPU model server, into the <em>attention and MLP math itself</em>, and back up as a stream of Server-Sent-Events. Part A draws the architecture; Part B traces one request through every box. If you can hold both halves in your head at once, you understand how a model becomes a product.</p>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Think of the platform as a high-end restaurant. The <strong>front door and security</strong> are the edge (CDN, TLS, WAF) &mdash; they keep the street out and point you to the nearest location. The <strong>ma&icirc;tre d&rsquo;</strong> is the API gateway: checks your reservation (auth), makes sure no single table orders the entire menu (rate limits), and hands you a ticket so a repeated order isn&rsquo;t cooked twice (idempotency). The <strong>waiters</strong> are the application services: they remember your table&rsquo;s history (the thread), write down the new order, and carry plates back and forth. The <strong>kitchen</strong> is the inference layer &mdash; an expediter (scheduler) batches tickets and assigns them to stations (GPU servers). And the <strong>chef actually cooking</strong> &mdash; chopping, searing, plating &mdash; is the attention and MLP math inside the model. Everything on this page is either the dining room or the kitchen; only the very last step is the chef.</p>
+      </div>
+
+      <h2>Part A &middot; The architecture</h2>
+      <p>A chat product looks deceptively simple from the outside &mdash; a text box and a stream of words. Underneath, every request crosses seven layers, each owning one job and handing off cleanly to the next. Here is the whole spine before we zoom into any one box.</p>
+
+      <div class="diagram">
+        <strong>The full request path, top to bottom</strong><br><br>
+        <strong>CLIENT</strong> &nbsp;web / mobile &mdash; threads list, message composer, SSE reader, optimistic UI<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;HTTPS &middot; POST /v1/threads/{id}/messages &middot; Bearer token &middot; Idempotency-Key<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+        <strong>EDGE</strong> &nbsp;CDN &middot; TLS termination &middot; WAF / DDoS &middot; geo-routing &middot; load balancing<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+        <strong>API GATEWAY / BFF</strong> &nbsp;authn &middot; authz/ACL &middot; validation &middot; idempotency &middot; rate limit (req + tokens) &middot; request-id / tracing<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+        <strong>APPLICATION SERVICES</strong> &nbsp;(stateless, horizontally scaled)<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;├─ Conversation svc &nbsp;(threads &amp; messages CRUD, ACL, pagination)<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;├─ Orchestration / inference-gateway &nbsp;(assemble prompt, prompt-cache, tier select, enqueue, stream)<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;├─ Safety / moderation &nbsp;(input + output classifiers)<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;└─ Billing &middot; title-gen &middot; background workers<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;│<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;▼ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &searr; reads / writes<br>
+        <strong>DATA STORES</strong> &nbsp;┌─────────────┬──────────────┬───────────────┬──────────────┐<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ PostgreSQL &nbsp;│ Redis &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ Object store &nbsp;│ Vector DB &nbsp;&nbsp;│ + OLAP warehouse<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ system of &nbsp;&nbsp;│ sessions &middot; &nbsp;│ attachments &middot;│ retrieval /  │<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ record &nbsp;&nbsp;&nbsp;&nbsp;│ limits &middot; &nbsp;&nbsp;│ blobs &middot; &nbsp;&nbsp;&nbsp;│ memory &middot;    │<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ users/threads│ queue &middot; &nbsp;&nbsp;│ exports &nbsp;&nbsp;&nbsp;│ semantic     │<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ /messages &nbsp;&nbsp;│ pub/sub &nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ search       │<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─────────────┴──────────────┴───────────────┴──────────────┘<br>
+        <br>
+        Orchestration ──► <strong>INFERENCE GATEWAY</strong> ──► <strong>SCHEDULER / ROUTER</strong> ──► <strong>GPU MODEL-SERVER FLEET</strong> (autoscaled)<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ continuous batching &middot; paged KV-cache<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;▼<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <strong>MODEL SERVER</strong> &nbsp;tokenize → embed → [ ATTENTION + MLP ] × L layers → logits → sample<br>
+        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─ tokens stream back up the same path, via Redis pub/sub → SSE → client<br>
+        <div class="cap">Seven layers. The cheap rejections (bad token, over quota) happen high and early; the expensive work (prefill + decode on a GPU) happens deep and late; tokens stream back up through pub/sub to the client. Cross-cutting concerns &mdash; tracing, secrets, feature flags, autoscaling, multi-region &mdash; wrap every box.</div>
+      </div>
+
+      <h3>1 &middot; Clients (web &amp; mobile)</h3>
+      <p>The client renders the <strong>threads list</strong> (a paginated sidebar of past conversations) and the active thread. When you send a message it does three things at once: optimistically appends your message to the UI immediately (so the app feels instant), opens a <strong>streaming connection</strong> for the reply (SSE or WebSocket), and shows a typing indicator until the first token lands. It must handle <strong>reconnection</strong> &mdash; mobile networks drop &mdash; by remembering the last event id and resuming the stream, and it must reconcile its optimistic state once the server confirms the real message ids.</p>
+      <p>SSE vs WebSocket: a chat reply is a one-way server&rarr;client token stream, so <strong>SSE</strong> (a long-lived HTTP response of <code>text/event-stream</code>) is the simpler fit &mdash; it rides normal HTTP, reconnects natively via <code>Last-Event-ID</code>, and needs no custom framing. WebSocket earns its keep only when you need rich bidirectional traffic (live collaboration, voice).</p>
+
+      <h3>2 &middot; Edge</h3>
+      <p>Before a request reaches your code it crosses the edge: a <strong>CDN</strong> serves static assets and the app shell from a POP near the user; <strong>TLS termination</strong> ends the encrypted connection at the edge; a <strong>WAF</strong> and DDoS scrubbing drop obvious attacks (SQL-injection probes, volumetric floods) before they cost you a backend thread; <strong>geo-routing</strong> sends the user to the nearest healthy region; and a <strong>load balancer</strong> spreads requests across gateway instances with health checks. The edge is your first, cheapest line of defense &mdash; the more junk it absorbs, the less your origin pays for.</p>
+
+      <h3>3 &middot; API gateway / BFF</h3>
+      <p>The gateway is the single choke point every API request passes through, which is exactly why it owns the cross-cutting work. In order, per request:</p>
+      <ul>
+        <li><strong>Authentication.</strong> Resolve the caller. A session token &rarr; a Redis lookup (<code>GET session:&lt;token&gt;</code>) returns the user and tenant; or a signed JWT is verified locally (no round-trip) and trusted until expiry. No identity &rarr; <code>401</code>, nothing downstream runs.</li>
+        <li><strong>Authorization / ACL.</strong> Is this user allowed to touch <em>this</em> thread? The deep check happens in the conversation service, but coarse scopes (is the token allowed to write messages at all?) are checked here.</li>
+        <li><strong>Request validation.</strong> Reject malformed bodies, oversized payloads, and bad content types before they reach business logic &mdash; schema-validate <code>{content, stream}</code>, cap message length.</li>
+        <li><strong>Idempotency.</strong> A client retry must not create two messages. The client sends an <code>Idempotency-Key</code>; the gateway records it (<code>SETNX idem:&lt;key&gt;</code>) and replays the stored result on a duplicate.</li>
+        <li><strong>Rate limiting.</strong> A token bucket per user/tenant, limiting <strong>both requests-per-minute AND tokens-per-minute</strong> &mdash; because LLM load scales with tokens, not request count. Over limit &rarr; <code>429</code> + <code>Retry-After</code>.</li>
+        <li><strong>Routing, request-ids &amp; tracing.</strong> Stamp a request id, start a distributed trace span, and route to the right service.</li>
+      </ul>
+
+      <h3>4 &middot; Application services (stateless, horizontally scaled)</h3>
+      <p>Behind the gateway sit small, stateless services you can scale independently. Keeping them stateless &mdash; all shared state pushed into the data stores &mdash; is what lets you run many copies behind the load balancer and lose any one without losing data.</p>
+      <table>
+        <thead><tr><th>Service</th><th>Owns</th><th>Why separate</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Conversation</strong></td><td>Threads &amp; messages CRUD, ACL enforcement, history pagination.</td><td>The system-of-record API. Pure data, no model calls &mdash; scales on DB load.</td></tr>
+          <tr><td><strong>Orchestration / inference-gateway</strong></td><td>Assemble the prompt, set prompt-cache breakpoints, pick the model tier, enqueue the job, own the stream.</td><td>The model-facing brain. Scales on inference demand; isolates provider quirks.</td></tr>
+          <tr><td><strong>Safety / moderation</strong></td><td>Input classifier (before generation) and output classifier (during streaming).</td><td>Independent policy + model, can be updated without touching the hot path code.</td></tr>
+          <tr><td><strong>Billing / workers</strong></td><td>Usage metering, title generation, async background jobs.</td><td>Off the critical path; runs from the queue so a slow job never blocks a reply.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>5 &middot; Data stores &mdash; and why each one</h3>
+      <p>The single most common design mistake is forcing everything into one database. Each store below is chosen for a property the others lack: durability, speed, blob capacity, or vector search.</p>
+
+      <p><strong>PostgreSQL &mdash; the system of record.</strong> Durable, transactional, relational. Users, threads, messages, and usage live here because you must never lose a message and you need foreign keys, joins, and consistency.</p>
+      <pre><code><span class="tok-key">CREATE TABLE</span> users (
+  id           uuid <span class="tok-key">PRIMARY KEY</span> <span class="tok-key">DEFAULT</span> gen_random_uuid(),
+  email        text <span class="tok-key">UNIQUE NOT NULL</span>,
+  tenant_id    uuid <span class="tok-key">NOT NULL</span>,
+  created_at   timestamptz <span class="tok-key">NOT NULL DEFAULT</span> now()
+);
+
+<span class="tok-key">CREATE TABLE</span> threads (
+  id           uuid <span class="tok-key">PRIMARY KEY</span> <span class="tok-key">DEFAULT</span> gen_random_uuid(),
+  user_id      uuid <span class="tok-key">NOT NULL REFERENCES</span> users(id),
+  title        text,
+  created_at   timestamptz <span class="tok-key">NOT NULL DEFAULT</span> now(),
+  updated_at   timestamptz <span class="tok-key">NOT NULL DEFAULT</span> now()
+);
+
+<span class="tok-key">CREATE TABLE</span> messages (
+  id           uuid <span class="tok-key">PRIMARY KEY</span> <span class="tok-key">DEFAULT</span> gen_random_uuid(),
+  thread_id    uuid <span class="tok-key">NOT NULL REFERENCES</span> threads(id) <span class="tok-key">ON DELETE CASCADE</span>,
+  role         text <span class="tok-key">NOT NULL CHECK</span> (role <span class="tok-key">IN</span> (<span class="tok-str">'user'</span>,<span class="tok-str">'assistant'</span>,<span class="tok-str">'system'</span>)),
+  content      text <span class="tok-key">NOT NULL</span>,
+  input_tokens  int,
+  output_tokens int,
+  created_at   timestamptz <span class="tok-key">NOT NULL DEFAULT</span> now()
+);
+
+<span class="tok-com">-- the hot query: load a thread in chronological order</span>
+<span class="tok-key">CREATE INDEX</span> idx_messages_thread_time <span class="tok-key">ON</span> messages (thread_id, created_at);
+<span class="tok-key">CREATE INDEX</span> idx_threads_user_updated <span class="tok-key">ON</span> threads (user_id, updated_at <span class="tok-key">DESC</span>);</code></pre>
+
+      <p><strong>Redis &mdash; the fast shared brain.</strong> In-memory, sub-millisecond, perfect for ephemeral hot state that many stateless instances share. It plays six roles here, each a different key:</p>
+      <pre><code>session:&lt;token&gt;          → {user_id, tenant_id, exp}     <span class="tok-com"># auth lookup</span>
+ratelimit:&lt;user&gt;:tpm     → token-bucket counter + ts     <span class="tok-com"># rate limiting</span>
+thread:&lt;id&gt;:cache        → serialized recent messages     <span class="tok-com"># hot-thread cache</span>
+idem:&lt;key&gt;               → stored response / in-flight     <span class="tok-com"># idempotency</span>
+queue:inference          → LPUSH/BRPOP job list           <span class="tok-com"># job queue</span>
+stream:&lt;reqid&gt;           → PUBLISH / SUBSCRIBE channel     <span class="tok-com"># token fan-out</span></code></pre>
+      <p>That last one is the trick that makes streaming scale: the model worker <code>PUBLISH</code>es each token to <code>stream:&lt;reqid&gt;</code>, and whichever gateway instance is holding the client&rsquo;s SSE connection is <code>SUBSCRIBE</code>d &mdash; so the worker and the connection-holder need not be the same machine.</p>
+
+      <p><strong>Object storage (S3-like) &mdash; big blobs.</strong> Attachments, images, uploaded documents, exported transcripts. Cheap, durable, infinitely scalable, and serve-able via signed URLs straight from the CDN. Postgres stores a <em>pointer</em> (the object key); the bytes never touch the database.</p>
+      <p><strong>Vector DB (optional) &mdash; retrieval &amp; memory.</strong> Embeddings of past threads, uploaded docs, or a knowledge base, indexed for nearest-neighbor search. When a thread should &ldquo;remember&rdquo; earlier context that has scrolled out of the window, or answer over a document, you embed the query and pull the top-k relevant chunks into the prompt (RAG).</p>
+      <p><strong>Analytics / warehouse (OLAP) &mdash; offline truth.</strong> A columnar store for events, evals, and dashboards. You never run product analytics on the operational Postgres &mdash; long scans there would hurt the live path. Usage and interaction events stream into the warehouse for cost dashboards, quality evals, and product metrics.</p>
+
+      <div class="callout key">
+        <span class="label">Pick the store for the property, not the habit</span>
+        <p>Durability and relations &rarr; <strong>Postgres</strong>. Speed and ephemerality &rarr; <strong>Redis</strong>. Large opaque bytes &rarr; <strong>object storage</strong>. Similarity search &rarr; <strong>vector DB</strong>. Big offline scans &rarr; <strong>warehouse</strong>. The interview answer is never &ldquo;put it all in Postgres&rdquo; or &ldquo;cache everything in Redis&rdquo; &mdash; it is naming the one property that forces each choice.</p>
+      </div>
+
+      <h3>6 &middot; Inference layer</h3>
+      <p>The orchestration service does not talk to GPUs directly. It hands the job to an <strong>inference gateway</strong>, which fronts a <strong>scheduler/router</strong>, which dispatches to an autoscaled <strong>fleet of GPU model servers</strong>. The cleverness lives in the scheduler and the servers:</p>
+      <ul>
+        <li><strong>Continuous (in-flight) batching.</strong> Rather than wait to assemble a fixed batch, the server adds and removes sequences from the running batch every step, so a new request joins almost immediately and finished ones leave &mdash; keeping the GPU saturated without making anyone wait for a batch to fill.</li>
+        <li><strong>Paged KV-cache.</strong> Each request&rsquo;s growing KV cache is stored in fixed-size pages (like virtual memory) instead of one contiguous block, so memory isn&rsquo;t fragmented and you can pack far more concurrent sequences onto a card.</li>
+        <li><strong>Prefix / prompt caching.</strong> The server keeps the computed KV state of stable prefixes (system prompt, early history). A repeat request with the same prefix is a <strong>cache hit</strong> &mdash; that prefill is skipped entirely, slashing TTFT and cost (cached input often bills at ~0.1&times;).</li>
+        <li><strong>Admission control / backpressure.</strong> When the fleet is saturated, the scheduler refuses or queues new work rather than thrashing &mdash; an explicit signal upstream instead of a meltdown.</li>
+        <li><strong>Model-tier routing &amp; fallback.</strong> Route by task: a small/fast tier (Haiku 4.5) for easy turns, balanced (Sonnet 4.6) for the everyday, most-capable (Opus 4.8) for hard reasoning &mdash; with a fallback tier if the primary is down.</li>
+      </ul>
+
+      <h3>7 &middot; Cross-cutting concerns</h3>
+      <p>Wrapping every box: <strong>observability</strong> (distributed traces across the hops, metrics for p50/p99 latency, TTFT, tokens/sec, error rate, and cost &mdash; sliced per tenant; structured logs with the request id); <strong>secrets management</strong> (keys and DB creds from a vault, never in code); <strong>feature flags</strong> (ship a new model tier to 1% first); <strong>autoscaling</strong> (stateless services scale on CPU/RPS, the GPU fleet on queue depth); <strong>multi-region</strong> (data residency + failover); and <strong>reliability</strong> (timeouts on every outbound call, retries with budgets and jitter, idempotency keys, circuit breakers when a dependency is clearly down, and graceful degradation &mdash; a smaller model beats an error).</p>
+
+      <div class="viz" data-viz="barchart"
+        data-title="Where the end-to-end latency goes"
+        data-sub="One streamed reply, time to the LAST token. Illustrative ms. The model dominates &mdash; and within it, decode dominates."
+        data-groups='["Network + TLS","Auth + rate limit","DB load history","Queue + admission","Prefill (TTFT)","Decode (all output tokens)"]'
+        data-series='[
+          {"name":"Cold (no prompt-cache hit)","color":"#f0986b","values":[40,8,15,30,420,2600]},
+          {"name":"Warm (prefix cache hit)","color":"#5fd38a","values":[40,8,12,25,90,2600]}
+        ]'
+        data-cap="The platform overhead (network, auth, DB, queue) is a sliver. <strong>Prefill</strong> is what a prompt-cache hit collapses &mdash; the warm bar skips re-prefilling the stable prefix, so TTFT drops sharply. <strong>Decode</strong> barely moves: every output token is still its own sequential forward pass. To cut total latency you shorten the output or route to a faster tier; to cut TTFT you cache the prefix."></div>
+
+      <h2>Part B &middot; Trace one request: &ldquo;send a message in a thread&rdquo;</h2>
+      <p>Now the payoff: one request, numbered hop by hop, from the browser to the attention math and back. Follow the stepper, then read the concrete examples under each stage.</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="The request lifecycle, end to end"
+        data-sub="Click Next: one POST from the client down to the model and back as a stream."
+        data-steps='[
+          {"op":"1 · Client POSTs the message","shape":"POST /v1/threads/{id}/messages","note":"Body {content, stream:true}, Authorization: Bearer, Idempotency-Key. The UI optimistically shows your message and opens the SSE reader."},
+          {"op":"2 · Edge → gateway","shape":"TLS · WAF · auth · idem · rate limit","note":"Verify session (Redis GET session), claim idempotency (SETNX idem), check the token bucket (req AND tokens), kick off input moderation. 401 or 429 short-circuits here."},
+          {"op":"3 · Conversation service","shape":"ACL + load history + append","note":"Check the user owns the thread. Read history (Redis thread cache, else Postgres SELECT). INSERT the new user message; invalidate/refresh the cache."},
+          {"op":"4 · Orchestration assembles the prompt","shape":"system + history + new turn","note":"Build the messages array, set a cache_control breakpoint on the stable prefix, count tokens, pick the model tier, enqueue the job, SUBSCRIBE to stream:reqid."},
+          {"op":"5 · Inference gateway → scheduler","shape":"admit + prefix-cache check","note":"Pick a model server with capacity. It checks its prefix/KV cache: a HIT on the stable prefix means prefill is skipped for those tokens."},
+          {"op":"6 · Model-server forward pass","shape":"prefill → first token → decode loop","note":"Tokenize, embed, run L layers of attention+MLP. Prefill all new tokens in parallel → first token (TTFT). Then decode one token per pass, appending K/V to the cache."},
+          {"op":"7 · Streaming back","shape":"PUBLISH → SUBSCRIBE → SSE data:","note":"Each token is PUBLISHed to Redis; the gateway holding the SSE connection forwards it as an SSE event. Output moderation runs incrementally and can cut the stream."},
+          {"op":"8 · Completion","shape":"persist + meter + refresh cache","note":"INSERT the assistant message, record usage (input/output, cache_read vs cache_creation), refresh thread + prefix caches, maybe enqueue title-gen, emit analytics."}
+        ]'
+        data-cap="Cheap rejections high and early (steps 2&ndash;3); the expensive GPU work deep and late (steps 5&ndash;6); tokens stream back up through pub/sub (step 7). Step 8 makes it all durable."></div>
+
+      <h3>Step 1 &middot; The client sends the message</h3>
+      <p>The browser opens an HTTPS request. <code>stream:true</code> asks for an SSE response; the <code>Idempotency-Key</code> is a fresh UUID the client generates per send so a retry is safe.</p>
+      <pre><code>POST /v1/threads/3f9a.../messages HTTP/2
+Host: api.example.com
+Authorization: Bearer sess_8e21c0...
+Idempotency-Key: 5b1e-44a2-9c7f-01
+Content-Type: application/json
+Accept: text/event-stream
+
+{ <span class="tok-str">"content"</span>: <span class="tok-str">"Summarize the thread so far in 3 bullets."</span>, <span class="tok-str">"stream"</span>: <span class="tok-key">true</span> }</code></pre>
+
+      <h3>Step 2 &middot; Edge &rarr; gateway</h3>
+      <p>The edge terminates TLS, runs WAF rules, and geo-routes to the nearest region&rsquo;s load balancer. The gateway then does its checklist against Redis &mdash; all sub-millisecond:</p>
+      <pre><code><span class="tok-com"># auth: resolve the session token → user + tenant</span>
+GET session:sess_8e21c0...        → {user_id, tenant_id, exp}   <span class="tok-com"># miss → 401</span>
+
+<span class="tok-com"># idempotency: claim the key; if it already exists, replay the stored result</span>
+SETNX idem:5b1e-44a2-9c7f-01 "in-flight"  EX 86400
+
+<span class="tok-com"># rate limit: token bucket, BOTH dimensions, atomically (Lua)</span>
+EVAL token_bucket  ratelimit:&lt;user&gt;:rpm  1            <span class="tok-com"># 1 request</span>
+EVAL token_bucket  ratelimit:&lt;user&gt;:tpm  &lt;est_tokens&gt;  <span class="tok-com"># estimated cost</span></code></pre>
+      <p>Input moderation starts in parallel. If the bucket is empty, the gateway short-circuits before any model work:</p>
+      <pre><code>HTTP/2 429 Too Many Requests
+Retry-After: 7
+Content-Type: application/json
+
+{ <span class="tok-str">"error"</span>: { <span class="tok-str">"type"</span>: <span class="tok-str">"rate_limit"</span>, <span class="tok-str">"message"</span>: <span class="tok-str">"Token budget exceeded; retry after 7s."</span> } }</code></pre>
+
+      <h3>Step 3 &middot; Conversation service: ACL, load history, append</h3>
+      <p>First the deep ACL check &mdash; does this user own this thread? Then load history: try the hot cache, fall back to Postgres.</p>
+      <pre><code><span class="tok-com"># fast path: hot-thread cache</span>
+GET thread:3f9a...:cache          <span class="tok-com"># hit → recent messages, skip the DB</span>
+
+<span class="tok-com"># slow path on a miss: the indexed read</span>
+<span class="tok-key">SELECT</span> role, content, created_at
+<span class="tok-key">FROM</span> messages
+<span class="tok-key">WHERE</span> thread_id = $1
+<span class="tok-key">ORDER BY</span> created_at <span class="tok-key">ASC</span>
+<span class="tok-key">LIMIT</span> 200;                       <span class="tok-com"># uses idx_messages_thread_time</span></code></pre>
+      <p>Append the new user message, then invalidate (or update) the cache so the next read is consistent:</p>
+      <pre><code><span class="tok-key">INSERT INTO</span> messages (thread_id, role, content, input_tokens)
+<span class="tok-key">VALUES</span> ($1, <span class="tok-str">'user'</span>, $2, $3)
+<span class="tok-key">RETURNING</span> id, created_at;
+
+<span class="tok-com"># then in Redis</span>
+DEL thread:3f9a...:cache          <span class="tok-com"># invalidate; or RPUSH the new message + EXPIRE</span></code></pre>
+
+      <h3>Step 4 &middot; Orchestration assembles the prompt</h3>
+      <p>The orchestration service builds the model input: the <strong>system prompt</strong>, then the <strong>prior turns</strong>, then the <strong>new message</strong>. It places a prompt-cache breakpoint on the <em>stable prefix</em> &mdash; the system prompt and early history &mdash; so on repeat turns that prefix is a cache read (~0.1&times;) instead of a fresh prefill. It counts tokens, picks the tier, enqueues the job, and subscribes to the stream.</p>
+      <pre><code>messages = [
+  { <span class="tok-str">"role"</span>: <span class="tok-str">"system"</span>,
+    <span class="tok-str">"content"</span>: [ { <span class="tok-str">"type"</span>: <span class="tok-str">"text"</span>, <span class="tok-str">"text"</span>: <span class="tok-str">"&lt;long stable system prompt&gt;"</span>,
+                  <span class="tok-str">"cache_control"</span>: { <span class="tok-str">"type"</span>: <span class="tok-str">"ephemeral"</span> } } ] },  <span class="tok-com"># ← breakpoint: cache the prefix</span>
+  { <span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>,      <span class="tok-str">"content"</span>: <span class="tok-str">"&lt;turn 1&gt;"</span> },
+  { <span class="tok-str">"role"</span>: <span class="tok-str">"assistant"</span>, <span class="tok-str">"content"</span>: <span class="tok-str">"&lt;reply 1&gt;"</span> },
+  { <span class="tok-str">"role"</span>: <span class="tok-str">"user"</span>,      <span class="tok-str">"content"</span>: <span class="tok-str">"Summarize the thread so far in 3 bullets."</span> }  <span class="tok-com"># ← dynamic tail</span>
+]</code></pre>
+      <pre><code>LPUSH queue:inference  {reqid, tenant, model:"sonnet-4-6", messages, max_tokens:512}
+SUBSCRIBE stream:&lt;reqid&gt;          <span class="tok-com"># this gateway now relays tokens as they arrive</span></code></pre>
+
+      <div class="callout key">
+        <span class="label">Cache the head, vary the tail</span>
+        <p>Stable content first (system prompt, tools, early history), volatile content last (the new user turn). That ordering is what makes the prefix a byte-identical cache hit every turn. Put a timestamp or the user&rsquo;s name at the <em>top</em> and you invalidate the cache for everything after it &mdash; re-paying full prefill on every message.</p>
+      </div>
+
+      <h3>Step 5 &middot; Inference gateway &rarr; scheduler</h3>
+      <p>A worker <code>BRPOP</code>s the job. The inference gateway asks the scheduler for a model server with capacity (admission control &mdash; if none, the job waits in the bounded queue, applying backpressure). The chosen server checks its prefix/KV cache: a <strong>prompt-cache HIT</strong> on the stable prefix means prefill is skipped for those tokens, and only the dynamic tail is prefilled fresh.</p>
+
+      <h3>Step 6 &middot; The model-server forward pass (attention + MLP)</h3>
+      <p>This is the chef finally cooking. The server turns text into tokens, tokens into vectors, and runs them through <code>L</code> identical transformer layers &mdash; each layer is <strong>self-attention</strong> (the social step) followed by an <strong>MLP</strong> (the private step), with residual adds around both. Watch the two phases.</p>
+
+      <div class="viz" data-viz="flow"
+        data-title="Inside the model server: prefill then decode"
+        data-sub="Click Next: tokenize → embed → prefill (attn+mlp ×L) → first token → decode loop → stream."
+        data-steps='[
+          {"op":"tokenize","shape":"text → token ids","note":"The assembled prompt becomes integer token ids. A cache hit means the prefix ids are already represented in saved KV state."},
+          {"op":"embedding lookup","shape":"ids → [B, S, H]","note":"Each id indexes a row of the embedding table, producing the residual stream: a batch of B sequences, S tokens, each an H-wide vector."},
+          {"op":"PREFILL · attention ×L","shape":"project Q/K/V · causal SDPA","note":"All new prompt tokens at once. Each layer projects Q,K,V, runs scaled dot-product attention with a causal mask, and WRITES K/V into the KV cache. Compute-bound, parallel."},
+          {"op":"PREFILL · MLP ×L","shape":"gelu · expand→contract","note":"Same layers: the MLP expands H→I (≈4H), applies GELU, contracts I→H, touching each token independently. Residual adds wrap attention and MLP."},
+          {"op":"first token / TTFT","shape":"logits → sample token 1","note":"After L layers, the last position’s vector → logits over the vocab → sample the first output token. The moment the user sees something: time to first token."},
+          {"op":"DECODE loop","shape":"1 token per forward pass","note":"Embed the ONE new token; per layer compute its Q/K/V, APPEND K/V to the cache, attend over the whole cached K/V, run the MLP, residual. Memory-bandwidth-bound, sequential."},
+          {"op":"sample + stream","shape":"token → PUBLISH","note":"Sample the next token, PUBLISH it to stream:reqid, append its K/V, loop. Each token streams the instant it is produced."},
+          {"op":"stop","shape":"EOS or max_tokens","note":"The loop ends at an end-of-sequence token or the output cap. This request’s KV cache is freed for the next sequence in the batch."}
+        ]'
+        data-cap="Prefill is one parallel pass over all prompt tokens (fills the cache, compute-bound); decode is one sequential pass per output token (reads the whole cache, memory-bound). Attention is the only place tokens mix; the MLP works on each token alone."></div>
+
+      <p>In pseudocode, the prefill processes the whole prompt at once and fills the cache:</p>
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">prefill</span>(prompt_ids, cache):
+    x = embed(prompt_ids)                 <span class="tok-com"># [B, S, H]  residual stream</span>
+    <span class="tok-key">for</span> layer <span class="tok-key">in</span> layers:                  <span class="tok-com"># L transformer blocks</span>
+        q, k, v = layer.qkv(x)            <span class="tok-com"># project: [B, heads, S, head_dim]</span>
+        cache[layer].store(k, v)          <span class="tok-com"># WRITE K/V for every prompt token</span>
+        a = sdpa(q, k, v, is_causal=<span class="tok-key">True</span>) <span class="tok-com"># causal attention, all positions at once</span>
+        x = x + layer.o(a)                <span class="tok-com"># attention + residual</span>
+        x = x + layer.mlp(x)              <span class="tok-com"># gelu(expand)→contract + residual</span>
+    logits = unembed(x[:, -1])            <span class="tok-com"># only the last position matters now</span>
+    <span class="tok-key">return</span> sample(logits)                 <span class="tok-com"># the FIRST output token → TTFT</span></code></pre>
+
+      <p>Then the decode loop runs one token at a time, computing K/V only for the single new token and attending over everything already cached:</p>
+      <pre><code><span class="tok-key">def</span> <span class="tok-fn">decode_step</span>(prev_token, cache):
+    x = embed(prev_token)                 <span class="tok-com"># [B, 1, H]  just ONE token</span>
+    <span class="tok-key">for</span> layer <span class="tok-key">in</span> layers:
+        q, k, v = layer.qkv(x)            <span class="tok-com"># Q/K/V for the one new token</span>
+        k_all, v_all = cache[layer].append(k, v)  <span class="tok-com"># APPEND, get full history</span>
+        a = sdpa(q, k_all, v_all)         <span class="tok-com"># attend over ALL cached K/V</span>
+        x = x + layer.o(a)
+        x = x + layer.mlp(x)
+    <span class="tok-key">return</span> sample(unembed(x[:, -1]))      <span class="tok-com"># next token; loop until EOS / max_tokens</span></code></pre>
+
+      <div class="callout eli5">
+        <span class="label">ELI5</span>
+        <p>Prefill is the chef reading the entire recipe and prepping every ingredient on the counter in one burst &mdash; fast, all at once. Decode is plating the dish one spoonful at a time, glancing at the whole prepped counter (the KV cache) before each spoonful, and never re-prepping what&rsquo;s already laid out. The reading is quick; the one-spoonful-at-a-time plating is why a long answer takes a while.</p>
+      </div>
+
+      <h3>Step 7 &middot; Streaming back</h3>
+      <p>Each generated token is <code>PUBLISH</code>ed to <code>stream:&lt;reqid&gt;</code>. The gateway instance holding the client&rsquo;s SSE connection is <code>SUBSCRIBE</code>d and forwards each as an SSE <code>data:</code> event. Output moderation runs incrementally; on a flag it can cut the stream mid-flight.</p>
+      <pre><code>HTTP/2 200 OK
+Content-Type: text/event-stream
+
+event: message_start
+data: {"id":"msg_a1...","model":"sonnet-4-6"}
+
+event: content_block_delta
+data: {"delta":{"text":"- The thread"}}
+
+event: content_block_delta
+data: {"delta":{"text":" covers the Q3 plan"}}
+
+event: message_stop
+data: {"usage":{"input_tokens":1840,"output_tokens":96,"cache_read_tokens":1600}}</code></pre>
+
+      <h3>Step 8 &middot; Completion</h3>
+      <p>When the stream ends the work becomes durable. Persist the assistant message, record usage (separating <strong>cache_read</strong> vs <strong>cache_creation</strong> tokens, since they bill differently), refresh the caches with a TTL, maybe enqueue title generation for a new thread, and emit analytics events to the warehouse.</p>
+      <pre><code><span class="tok-key">INSERT INTO</span> messages (thread_id, role, content, input_tokens, output_tokens)
+<span class="tok-key">VALUES</span> ($1, <span class="tok-str">'assistant'</span>, $2, 1840, 96);
+
+<span class="tok-key">UPDATE</span> threads <span class="tok-key">SET</span> updated_at = now() <span class="tok-key">WHERE</span> id = $1;</code></pre>
+      <pre><code>RPUSH thread:3f9a...:cache &lt;assistant msg&gt;   EXPIRE thread:3f9a...:cache 3600
+SET   idem:5b1e-44a2-9c7f-01 &lt;final result&gt; EX 86400   <span class="tok-com"># replay on retry</span>
+LPUSH queue:billing  {tenant, model, input:1840, output:96, cache_read:1600}
+LPUSH queue:titlegen {thread_id}             <span class="tok-com"># only if title is still null</span></code></pre>
+
+      <h3>Step 9 &middot; Failure modes at each hop</h3>
+      <table>
+        <thead><tr><th>Hop</th><th>What can go wrong</th><th>How the design handles it</th></tr></thead>
+        <tbody>
+          <tr><td>Gateway</td><td>Upstream timeout; request hangs.</td><td>Per-hop deadline; return a clear error, never a hung thread.</td></tr>
+          <tr><td>Rate limit</td><td>Tenant floods the platform.</td><td><code>429</code> + <code>Retry-After</code>; bounded queue applies backpressure instead of overload.</td></tr>
+          <tr><td>Model server</td><td>OOM &rarr; KV cache eviction.</td><td>Paged cache + admission control; evict/preempt the lowest-priority sequence, resume from saved state.</td></tr>
+          <tr><td>Stream</td><td>Client disconnects mid-reply.</td><td>Client reconnects with <code>Last-Event-ID</code>; gateway resumes from the Redis stream offset.</td></tr>
+          <tr><td>Retry</td><td>Network retry of a send.</td><td>Idempotency key de-dupes: replay the stored result, do not generate (or bill) twice.</td></tr>
+          <tr><td>Generation</td><td>Output flagged or cut off.</td><td>Persist the partial with a stop reason; output moderation can terminate the stream cleanly.</td></tr>
+        </tbody>
+      </table>
+
+      <div class="callout gotcha">
+        <span class="label">Gotcha: the stateful streaming connection</span>
+        <p>The SSE connection lives on <em>one</em> gateway instance, but the model worker that produces tokens is a <em>different</em> machine. If you try to have the worker write directly to the socket, you couple them and break horizontal scaling. The fix is the indirection in step 7: the worker <code>PUBLISH</code>es to Redis, and whichever instance holds the socket <code>SUBSCRIBE</code>s. Keep the connection-holder dumb and stateless; let the shared store do the fan-out. The same indirection is what makes reconnect-and-resume possible.</p>
+      </div>
+
+      <h2>How this shows up in the interview</h2>
+
+      <h3>Q1 &middot; &ldquo;Design the chat API with streaming and threads.&rdquo;</h3>
+      <p>Start with the resource model and the streaming contract. <em>&ldquo;Threads own messages; a send is <code>POST /v1/threads/{id}/messages</code> with <code>stream:true</code>, and the reply comes back as SSE.&rdquo;</em> Then walk the spine: stateless services behind a gateway, Postgres as the system of record, Redis for sessions/limits/cache and a pub-sub stream for token fan-out, and an inference gateway in front of the GPU fleet. Make three things explicit: <strong>optimistic UI + reconnection</strong> on the client (resume via <code>Last-Event-ID</code>), <strong>idempotency keys</strong> so a retried send doesn&rsquo;t double-post, and the <strong>pub/sub indirection</strong> that lets any gateway instance relay tokens from any worker. That last point is what separates &ldquo;I&rsquo;ve called a streaming API&rdquo; from &ldquo;I&rsquo;ve built one.&rdquo;</p>
+
+      <h3>Q2 &middot; &ldquo;What is each data store for, and why that store?&rdquo;</h3>
+      <p>Name the property that forces each choice. <strong>Postgres</strong> &mdash; durability + relations + transactions, so messages are never lost and ACLs join cleanly. <strong>Redis</strong> &mdash; sub-ms shared state for sessions, rate-limit counters, the hot-thread cache, idempotency keys, the job queue, and pub/sub streaming; it&rsquo;s ephemeral on purpose. <strong>Object storage</strong> &mdash; large opaque blobs (attachments, exports) served from the CDN, with only a pointer in Postgres. <strong>Vector DB</strong> &mdash; nearest-neighbor search for retrieval/memory when relevant context has scrolled out of the window. <strong>Warehouse</strong> &mdash; offline columnar scans for evals and cost dashboards, kept off the live Postgres. The wrong answer is one store doing all five jobs.</p>
+
+      <h3>Q3 &middot; &ldquo;Where does the latency go, and how do you cut it?&rdquo;</h3>
+      <p>Separate the two clocks. <strong>TTFT</strong> = queue wait + prefill, so it&rsquo;s driven by prompt length and whether the stable prefix is a prompt-cache hit &mdash; cache the prefix and TTFT collapses. <strong>Total time</strong> is dominated by <strong>decode</strong>: each output token is its own sequential forward pass reading the whole KV cache, so the lever is a shorter output (cap <code>max_tokens</code>, instruct for brevity) or a faster tier. Platform overhead (network, auth, DB, queue) is a sliver &mdash; don&rsquo;t micro-optimize it before the model. And always stream, so perceived latency tracks TTFT, not the full decode. Report p99, not the average.</p>
+
+      <h3>Q4 &middot; &ldquo;Trace a request end to end.&rdquo;</h3>
+      <p>Walk Part B out loud: client <code>POST</code> with bearer token + idempotency key &rarr; edge (TLS/WAF/geo) &rarr; gateway (auth via Redis, idempotency <code>SETNX</code>, token-bucket rate limit on requests <em>and</em> tokens) &rarr; conversation service (ACL, load history from cache-or-Postgres, INSERT the message) &rarr; orchestration (assemble system+history+turn, set the prompt-cache breakpoint, enqueue, subscribe) &rarr; scheduler admits to a GPU server &rarr; forward pass (tokenize, embed, prefill all tokens through attention+MLP ×L filling the KV cache, sample the first token = TTFT, then the decode loop appending K/V per token) &rarr; each token <code>PUBLISH</code>ed to Redis and forwarded as SSE &rarr; completion (persist the assistant message, meter cache_read vs cache_creation, refresh caches, emit analytics). The signal you&rsquo;re sending: cheap rejections high and early, the expensive math deep and late, tokens streaming back up through pub/sub.</p>
+
+      <h2>Check your understanding</h2>
+      <details class="quiz">
+        <summary>Why route token streaming through Redis pub/sub instead of having the GPU worker write straight to the client&rsquo;s connection?</summary>
+        <div class="answer">
+          <p>Because the SSE connection lives on one stateless gateway instance while the worker that generates tokens is a different machine, and the scheduler may even move the work between servers. If the worker wrote directly to the socket you&rsquo;d couple producer and connection-holder, breaking horizontal scaling and making reconnects impossible. Publishing each token to <code>stream:&lt;reqid&gt;</code> and letting whichever instance holds the socket subscribe decouples them: any worker can feed any connection, and a reconnecting client can resume from the stream offset.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>In the forward pass, why is the first output token (TTFT) produced by a single parallel pass, but the next 200 tokens take far longer in total?</summary>
+        <div class="answer">
+          <p>The first token comes out of <strong>prefill</strong>: all prompt tokens go through the L layers together in one compute-bound, parallel pass that also fills the KV cache &mdash; fast per token. Every token after that is a <strong>decode</strong> step: a separate sequential forward pass that reads all the weights plus the entire growing KV cache out of memory to produce just one token, then appends its K/V and loops. Decode is memory-bandwidth-bound and strictly serial (token N needs token N-1), so 200 output tokens are 200 back-to-back passes &mdash; which is why decode, not prefill, dominates total latency.</p>
+        </div>
+      </details>
+      <details class="quiz">
+        <summary>A client&rsquo;s phone drops the connection, retries the send, and the user ends up with two identical messages and a double bill. What was missing, and where does it get fixed?</summary>
+        <div class="answer">
+          <p>The idempotency mechanism. The client should send a stable <code>Idempotency-Key</code> per logical send, and the gateway should claim it (<code>SETNX idem:&lt;key&gt;</code>) before doing any work. On the retry the key already exists, so the gateway replays the stored result instead of inserting a second message and re-running generation. It&rsquo;s fixed at the gateway (step 2), reinforced by the conversation service treating the insert as part of the idempotent unit, and the stored final result (step 8) is what gets replayed. Pair it with reconnect-via-<code>Last-Event-ID</code> so the resumed client re-attaches to the original stream rather than starting a new one.</p>
+        </div>
+      </details>
+
+      <div data-pagenav></div>
+    </div>
+  </main>
+</div>
+<script src="course.js"></script>
+</body>
+</html>
