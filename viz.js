@@ -332,7 +332,165 @@
     update();
   }
 
-  const REGISTRY = { barchart, collective, memcalc, attention, shard, flow, costcalc };
+  /* ---------------- 8. Interactive architecture diagram ---------------- */
+  const ARCH_PRESETS = {
+    "chat-platform": {
+      layers: {
+        client:    { label: "Client",        color: "#57b6f5" },
+        edge:      { label: "Edge",          color: "#f0c674" },
+        gateway:   { label: "API gateway",   color: "#c099f0" },
+        services:  { label: "Services",      color: "#5fd38a" },
+        data:      { label: "Data stores",   color: "#f0986b" },
+        inference: { label: "Inference",     color: "#f08b8b" },
+      },
+      nodes: [
+        { id: "client",  title: "Browser / App", sub: "threads · SSE",        layer: "client",    col: 0, row: 0, desc: "The web or mobile client. Renders the threads list and streams the assistant reply token-by-token over SSE; handles optimistic UI and reconnection." },
+        { id: "edge",    title: "Edge",          sub: "CDN · TLS · WAF",       layer: "edge",      col: 1, row: 0, desc: "CDN, TLS termination, WAF / DDoS protection and geo-routing. Forwards the request to the nearest API gateway." },
+        { id: "gateway", title: "API Gateway",   sub: "auth · rate-limit",     layer: "gateway",   col: 2, row: 0, desc: "Verifies the session (Redis), enforces idempotency keys, applies token-bucket rate limits (by request AND by tokens), validates the body and attaches a trace id." },
+        { id: "conv",    title: "Conversation",  sub: "threads & messages",    layer: "services",  col: 3, row: 0, desc: "Owns threads and messages. Enforces ACLs, loads history (hot path from Redis, source of truth in Postgres) and appends the new user message." },
+        { id: "orch",    title: "Orchestration", sub: "prompt · routing",      layer: "services",  col: 4, row: 0, desc: "Assembles the final prompt (system + history + new turn), sets the prompt-cache breakpoint on the stable prefix, picks the model tier and enqueues the inference job." },
+        { id: "igw",     title: "Inference GW",  sub: "admission · batching",  layer: "inference", col: 5, row: 0, desc: "Inference gateway — admission control, continuous (in-flight) batching and backpressure in front of the GPU fleet." },
+        { id: "sched",   title: "Scheduler",     sub: "route · KV cache",      layer: "inference", col: 6, row: 0, desc: "Routes the request to a model server with capacity and checks its paged KV cache / prefix cache for a prompt-cache hit." },
+        { id: "model",   title: "Model server",  sub: "embed→attn+MLP→sample", layer: "inference", col: 7, row: 0, desc: "A GPU model server. Runs the forward pass: embed → L transformer layers (attention + MLP) → sample. Maintains the KV cache and streams tokens out." },
+        { id: "olap",    title: "Warehouse",     sub: "events · evals",        layer: "data",      col: 0, row: 2, desc: "Analytics warehouse (OLAP) for product events, evals and dashboards — fed asynchronously, off the request path." },
+        { id: "redis",   title: "Redis",         sub: "cache · queue · pub/sub", layer: "data",    col: 2, row: 2, desc: "Sessions, rate-limit counters, hot-thread cache, idempotency keys, the inference job queue, and pub/sub channels that fan streamed tokens back to the client." },
+        { id: "pg",      title: "PostgreSQL",    sub: "system of record",      layer: "data",      col: 3, row: 2, desc: "The durable, transactional source of truth for users, threads, messages and usage. Indexed by thread_id + created_at." },
+        { id: "safety",  title: "Safety / Bill", sub: "moderation · metering", layer: "services",  col: 4, row: 2, desc: "Runs input and output moderation classifiers, meters token usage for billing and emits analytics events. Can cut a stream on a policy hit." },
+        { id: "vec",     title: "Vector DB",     sub: "retrieval · memory",    layer: "data",      col: 5, row: 2, desc: "Vector database for retrieval, long-term memory and semantic search over past threads or documents (optional — powers RAG)." },
+        { id: "s3",      title: "Object store",  sub: "blobs · files",         layer: "data",      col: 6, row: 2, desc: "Object storage for attachments, large message blobs and exported files. The database stores a pointer, not the bytes." },
+      ],
+      edges: [
+        { from: "client", to: "edge" }, { from: "edge", to: "gateway" }, { from: "gateway", to: "conv" },
+        { from: "conv", to: "orch" }, { from: "orch", to: "igw" }, { from: "igw", to: "sched" }, { from: "sched", to: "model" },
+        { from: "gateway", to: "redis", kind: "data" }, { from: "conv", to: "pg", kind: "data" },
+        { from: "conv", to: "redis", kind: "data" }, { from: "orch", to: "redis", kind: "data" },
+        { from: "orch", to: "safety", kind: "data" }, { from: "orch", to: "vec", kind: "data" },
+        { from: "conv", to: "s3", kind: "data" }, { from: "model", to: "redis", kind: "data" },
+      ],
+      path: [
+        { node: "client",  label: "POST /v1/threads/{id}/messages with stream:true" },
+        { node: "edge",    label: "TLS, WAF, geo-route to the nearest region" },
+        { node: "gateway", label: "verify session, idempotency, token-bucket rate limit" },
+        { node: "conv",    label: "load history (Redis → Postgres), append the message" },
+        { node: "orch",    label: "assemble prompt + cache_control, enqueue the job" },
+        { node: "igw",     label: "admission control + continuous batching" },
+        { node: "sched",   label: "route to a GPU, check the KV / prefix cache" },
+        { node: "model",   label: "prefill (attention + MLP × L) → first token → decode loop" },
+        { node: "client",  label: "tokens stream back via Redis pub/sub → SSE" },
+      ],
+    },
+  };
+
+  function architecture(el) {
+    const spec = ARCH_PRESETS[el.getAttribute("data-arch") || "chat-platform"];
+    if (!spec) { el.innerHTML = `<div class="viz-sub">unknown architecture preset</div>`; return; }
+    const W = 150, H = 56, GX = 40, GY = 44, PAD = 18;
+    const cols = Math.max(...spec.nodes.map((n) => n.col)) + 1;
+    const rows = Math.max(...spec.nodes.map((n) => n.row)) + 1;
+    const width = PAD * 2 + cols * W + (cols - 1) * GX;
+    const height = PAD * 2 + rows * H + (rows - 1) * GY;
+    const X = (c) => PAD + c * (W + GX), Y = (r) => PAD + r * (H + GY);
+    const byId = {}; spec.nodes.forEach((n) => (byId[n.id] = n));
+    const lc = (l) => (spec.layers[l] ? spec.layers[l].color : "#57b6f5");
+
+    function anchor(f, t) {
+      const fx = X(f.col), fy = Y(f.row), tx = X(t.col), ty = Y(t.row);
+      const fcx = fx + W / 2, fcy = fy + H / 2, tcx = tx + W / 2, tcy = ty + H / 2;
+      const dx = tcx - fcx, dy = tcy - fcy;
+      if (Math.abs(dx) >= Math.abs(dy)) return [[dx > 0 ? fx + W : fx, fcy], [dx > 0 ? tx : tx + W, tcy]];
+      return [[fcx, dy > 0 ? fy + H : fy], [tcx, dy > 0 ? ty : ty + H]];
+    }
+    const edgesSvg = spec.edges.map((e) => {
+      const f = byId[e.from], t = byId[e.to]; if (!f || !t) return "";
+      const [a, b] = anchor(f, t);
+      const dash = e.kind === "data" ? 'stroke-dasharray="4 4"' : "";
+      return `<line class="arch-edge ${e.kind || ""}" data-edge="${e.from}__${e.to}" x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" ${dash} marker-end="url(#arch-arrow)"/>`;
+    }).join("");
+    const nodesSvg = spec.nodes.map((n) => {
+      const x = X(n.col), y = Y(n.row), col = lc(n.layer);
+      return `<g class="arch-node" data-node="${n.id}" tabindex="0">
+        <rect x="${x}" y="${y}" width="${W}" height="${H}" rx="9" fill="${col}22" stroke="${col}"/>
+        <text class="arch-t" x="${x + W / 2}" y="${y + 23}" text-anchor="middle">${esc(n.title)}</text>
+        <text class="arch-s" x="${x + W / 2}" y="${y + 40}" text-anchor="middle">${esc(n.sub || "")}</text>
+      </g>`;
+    }).join("");
+    const legend = Object.keys(spec.layers).map((k) => `<span><span class="sw" style="background:${spec.layers[k].color}"></span>${esc(spec.layers[k].label)}</span>`).join("");
+
+    el.innerHTML =
+      (el.getAttribute("data-title") ? `<div class="viz-title">${esc(el.getAttribute("data-title"))}</div>` : "") +
+      (el.getAttribute("data-sub") ? `<div class="viz-sub">${esc(el.getAttribute("data-sub"))}</div>` : "") +
+      `<div class="controls"><button class="btn primary" data-play>▶ Animate a request</button><button class="btn" data-reset>Reset</button><span style="color:var(--text-dim);font-size:13px">Solid = request path · dashed = data access. Click any box.</span></div>` +
+      `<div class="arch-scroll"><svg class="arch-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="System architecture">
+         <defs><marker id="arch-arrow" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6 Z" fill="#5a6678"/></marker></defs>
+         ${edgesSvg}${nodesSvg}</svg></div>` +
+      `<div class="legend-row">${legend}</div>` +
+      `<div class="arch-detail" data-detail></div>` +
+      `<div class="step-label" data-step></div>`;
+
+    const detail = el.querySelector("[data-detail]");
+    const stepEl = el.querySelector("[data-step]");
+    const playBtn = el.querySelector("[data-play]");
+    const nodeEl = (id) => el.querySelector(`[data-node="${id}"]`);
+    const defaultDetail = `<span style="color:var(--text-dim)">Hover or click a component to see what it does, or press <strong>Animate a request</strong> to watch one message flow through the whole system.</span>`;
+
+    function showDetail(n) {
+      detail.innerHTML = `<span class="badge" style="background:${lc(n.layer)}22;color:${lc(n.layer)}">${esc(spec.layers[n.layer].label)}</span> <strong style="color:var(--text-bright)">${esc(n.title)}</strong><br>${esc(n.desc || "")}`;
+    }
+    function select(id) {
+      spec.nodes.forEach((n) => nodeEl(n.id).classList.toggle("sel", n.id === id));
+      showDetail(byId[id]);
+    }
+    spec.nodes.forEach((n) => {
+      const g = nodeEl(n.id);
+      g.addEventListener("click", () => select(n.id));
+      g.addEventListener("keypress", (e) => { if (e.key === "Enter") select(n.id); });
+      g.addEventListener("mouseenter", () => showDetail(n));
+    });
+    detail.innerHTML = defaultDetail;
+
+    let timer = null, step = -1;
+    function clearAnim() {
+      if (timer) { clearInterval(timer); timer = null; }
+      el.querySelectorAll(".arch-node").forEach((g) => g.classList.remove("active", "dim", "sel"));
+      el.querySelectorAll(".arch-edge").forEach((e) => e.classList.remove("active"));
+    }
+    function renderStep() {
+      el.querySelectorAll(".arch-node").forEach((g) => g.classList.add("dim"));
+      el.querySelectorAll(".arch-edge").forEach((e) => e.classList.remove("active"));
+      for (let i = 0; i <= step; i++) {
+        const id = spec.path[i].node, g = nodeEl(id);
+        g.classList.remove("dim");
+        g.classList.toggle("active", i === step);
+        if (i > 0) {
+          const prev = spec.path[i - 1].node;
+          const e = el.querySelector(`[data-edge="${prev}__${id}"]`) || el.querySelector(`[data-edge="${id}__${prev}"]`);
+          if (e) e.classList.add("active");
+        }
+      }
+      const s = spec.path[step];
+      stepEl.textContent = `Step ${step + 1}/${spec.path.length} — ${byId[s.node].title}: ${s.label}`;
+      showDetail(byId[s.node]);
+      nodeEl(s.node).classList.add("sel");
+    }
+    playBtn.addEventListener("click", () => {
+      clearAnim(); step = -1; playBtn.textContent = "⏸ Playing…";
+      timer = setInterval(() => {
+        step++;
+        if (step >= spec.path.length) {
+          clearInterval(timer); timer = null; playBtn.textContent = "▶ Replay";
+          el.querySelectorAll(".arch-node").forEach((g) => g.classList.remove("dim"));
+          return;
+        }
+        renderStep();
+      }, 850);
+    });
+    el.querySelector("[data-reset]").addEventListener("click", () => {
+      clearAnim(); step = -1; stepEl.textContent = ""; detail.innerHTML = defaultDetail;
+      playBtn.textContent = "▶ Animate a request";
+    });
+  }
+
+  const REGISTRY = { barchart, collective, memcalc, attention, shard, flow, costcalc, architecture };
 
   function init() {
     document.querySelectorAll(".viz[data-viz]").forEach((el) => {

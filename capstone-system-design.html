@@ -22,37 +22,10 @@
       <h2>Part A &middot; The architecture</h2>
       <p>A chat product looks deceptively simple from the outside &mdash; a text box and a stream of words. Underneath, every request crosses seven layers, each owning one job and handing off cleanly to the next. Here is the whole spine before we zoom into any one box.</p>
 
-      <div class="diagram">
-        <strong>The full request path, top to bottom</strong><br><br>
-        <strong>CLIENT</strong> &nbsp;web / mobile &mdash; threads list, message composer, SSE reader, optimistic UI<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;│ &nbsp;HTTPS &middot; POST /v1/threads/{id}/messages &middot; Bearer token &middot; Idempotency-Key<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;▼<br>
-        <strong>EDGE</strong> &nbsp;CDN &middot; TLS termination &middot; WAF / DDoS &middot; geo-routing &middot; load balancing<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;▼<br>
-        <strong>API GATEWAY / BFF</strong> &nbsp;authn &middot; authz/ACL &middot; validation &middot; idempotency &middot; rate limit (req + tokens) &middot; request-id / tracing<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;▼<br>
-        <strong>APPLICATION SERVICES</strong> &nbsp;(stateless, horizontally scaled)<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;├─ Conversation svc &nbsp;(threads &amp; messages CRUD, ACL, pagination)<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;├─ Orchestration / inference-gateway &nbsp;(assemble prompt, prompt-cache, tier select, enqueue, stream)<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;├─ Safety / moderation &nbsp;(input + output classifiers)<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;└─ Billing &middot; title-gen &middot; background workers<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;│<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;▼ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; &searr; reads / writes<br>
-        <strong>DATA STORES</strong> &nbsp;┌─────────────┬──────────────┬───────────────┬──────────────┐<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ PostgreSQL &nbsp;│ Redis &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ Object store &nbsp;│ Vector DB &nbsp;&nbsp;│ + OLAP warehouse<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ system of &nbsp;&nbsp;│ sessions &middot; &nbsp;│ attachments &middot;│ retrieval /  │<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ record &nbsp;&nbsp;&nbsp;&nbsp;│ limits &middot; &nbsp;&nbsp;│ blobs &middot; &nbsp;&nbsp;&nbsp;│ memory &middot;    │<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ users/threads│ queue &middot; &nbsp;&nbsp;│ exports &nbsp;&nbsp;&nbsp;│ semantic     │<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ /messages &nbsp;&nbsp;│ pub/sub &nbsp;&nbsp;&nbsp;│ &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ search       │<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─────────────┴──────────────┴───────────────┴──────────────┘<br>
-        <br>
-        Orchestration ──► <strong>INFERENCE GATEWAY</strong> ──► <strong>SCHEDULER / ROUTER</strong> ──► <strong>GPU MODEL-SERVER FLEET</strong> (autoscaled)<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;│ continuous batching &middot; paged KV-cache<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;▼<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; <strong>MODEL SERVER</strong> &nbsp;tokenize → embed → [ ATTENTION + MLP ] × L layers → logits → sample<br>
-        &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;└─ tokens stream back up the same path, via Redis pub/sub → SSE → client<br>
-        <div class="cap">Seven layers. The cheap rejections (bad token, over quota) happen high and early; the expensive work (prefill + decode on a GPU) happens deep and late; tokens stream back up through pub/sub to the client. Cross-cutting concerns &mdash; tracing, secrets, feature flags, autoscaling, multi-region &mdash; wrap every box.</div>
-      </div>
+      <div class="viz" data-viz="architecture" data-arch="chat-platform"
+        data-title="The whole system, interactive"
+        data-sub="Solid arrows are the request path; dashed arrows are data access. Click any box to see what it does, or press Animate a request to watch one message flow through end to end."
+        data-cap="The cheap rejections (bad token, over quota) happen high and early; the expensive work (prefill + decode on a GPU) happens deep and late; tokens stream back up through Redis pub/sub to the client. Cross-cutting concerns &mdash; tracing, secrets, feature flags, autoscaling, multi-region &mdash; wrap every box."></div>
 
       <h3>1 &middot; Clients (web &amp; mobile)</h3>
       <p>The client renders the <strong>threads list</strong> (a paginated sidebar of past conversations) and the active thread. When you send a message it does three things at once: optimistically appends your message to the UI immediately (so the app feels instant), opens a <strong>streaming connection</strong> for the reply (SSE or WebSocket), and shows a typing indicator until the first token lands. It must handle <strong>reconnection</strong> &mdash; mobile networks drop &mdash; by remembering the last event id and resuming the stream, and it must reconcile its optimistic state once the server confirms the real message ids.</p>

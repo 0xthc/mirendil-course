@@ -97,6 +97,28 @@
 .shard-wrap { display: grid; gap: 6px; justify-content: center; margin: 6px 0; }
 .shard-box { padding: 12px 8px; border-radius: 8px; font-family: var(--mono); font-size: 12px; text-align: center; border: 1px solid var(--border); transition: all .4s; }
 
+/* ---------- Interactive architecture diagram ---------- */
+.arch-scroll { overflow-x: auto; margin: 6px 0 2px; padding-bottom: 6px; }
+.arch-svg { min-width: 720px; display: block; }
+.arch-node { cursor: pointer; }
+.arch-node rect { transition: filter .2s, stroke-width .2s, opacity .25s; }
+.arch-node text { pointer-events: none; }
+.arch-node:focus { outline: none; }
+.arch-t { fill: var(--text-bright); font-size: 12.5px; font-weight: 600; font-family: var(--sans); }
+.arch-s { fill: var(--text-dim); font-size: 10px; font-family: var(--mono); }
+.arch-node:hover rect { filter: brightness(1.4); }
+.arch-node.sel rect { stroke-width: 2.5; }
+.arch-node.active rect { stroke-width: 3; filter: drop-shadow(0 0 7px var(--accent)) brightness(1.25); }
+.arch-node.dim { opacity: .28; }
+.arch-edge { stroke: #3c4757; stroke-width: 1.7; fill: none; }
+.arch-edge.data { stroke: #313e4d; opacity: .65; }
+.arch-edge.active { stroke: var(--accent); stroke-width: 2.8; opacity: 1; }
+.arch-detail {
+  margin-top: 14px; background: var(--bg); border: 1px solid var(--border);
+  border-radius: 9px; padding: 13px 16px; font-size: 14px; line-height: 1.55; min-height: 52px;
+}
+.arch-detail .badge { font-family: var(--mono); font-size: 11px; padding: 1px 7px; border-radius: 5px; }
+
 @media (max-width: 560px) {
   .viz .slider-row { grid-template-columns: 90px 1fr 64px; }
   .gpu { width: 72px; min-height: 72px; }
