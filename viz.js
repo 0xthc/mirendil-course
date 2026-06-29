@@ -379,6 +379,53 @@
         { node: "client",  label: "tokens stream back via Redis pub/sub → SSE" },
       ],
     },
+
+    "aws": {
+      layers: {
+        client:    { label: "Client",                color: "#57b6f5" },
+        edge:      { label: "Edge (Route 53 · CloudFront · WAF)", color: "#f0c674" },
+        gateway:   { label: "Load balancing",        color: "#c099f0" },
+        compute:   { label: "Compute (ECS / EKS)",   color: "#5fd38a" },
+        messaging: { label: "Messaging (SQS)",       color: "#e08bd0" },
+        data:      { label: "Data stores",           color: "#f0986b" },
+        inference: { label: "Inference (GPU)",       color: "#f08b8b" },
+        ops:       { label: "Observability",         color: "#8fa0b3" },
+      },
+      nodes: [
+        { id: "client",  title: "Client",            sub: "browser / app",          layer: "client",    col: 0, row: 0, desc: "Web or mobile client. Opens a long-lived SSE stream for the reply." },
+        { id: "cf",      title: "CloudFront",        sub: "CDN · WAF · Shield",      layer: "edge",      col: 1, row: 0, desc: "CloudFront edge with AWS WAF + Shield: TLS, static caching, and dropping attacks before they reach the VPC." },
+        { id: "alb",     title: "ALB",               sub: "L7 load balancer",        layer: "gateway",   col: 2, row: 0, desc: "Application Load Balancer — terminates the SSE-friendly long-lived HTTP connection and routes to a healthy app task. Preferred over API Gateway for streaming, which has short timeouts." },
+        { id: "app",     title: "ECS / EKS app",     sub: "auth · limit · enqueue",  layer: "compute",   col: 3, row: 0, desc: "The stateless app tier on ECS Fargate or EKS: authenticates (ElastiCache), rate-limits, loads the thread (Aurora), assembles the prompt, and enqueues the inference job (SQS)." },
+        { id: "sqs",     title: "Amazon SQS",        sub: "job queue",               layer: "messaging", col: 4, row: 0, desc: "Durable job queue decoupling the fast API from slow GPU work. A visibility timeout hides an in-flight job; a redrive policy sends repeatedly-failing (poison) jobs to the DLQ." },
+        { id: "infgw",   title: "Inference GW",      sub: "admission · batching",    layer: "inference", col: 5, row: 0, desc: "Consumes jobs from SQS, applies admission control and continuous batching, and routes to a model server (internal NLB / service mesh)." },
+        { id: "model",   title: "GPU model server",  sub: "vLLM · KV cache in HBM",  layer: "inference", col: 6, row: 0, desc: "EC2 GPU (p5/p4d/g5) on EKS running vLLM/TGI. Runs prefill + decode; the KV cache lives in GPU HBM, paged, with CPU/NVMe offload under pressure." },
+        { id: "route53", title: "Route 53",          sub: "DNS · geo",               layer: "edge",      col: 0, row: 2, desc: "DNS and latency/geo routing to the nearest CloudFront edge and a healthy region." },
+        { id: "cw",      title: "CloudWatch / X-Ray", sub: "metrics · traces",       layer: "ops",       col: 1, row: 2, desc: "Metrics (TTFT, tokens/sec, queue depth, p99), distributed traces (X-Ray / OpenTelemetry) and logs. Alarms drive autoscaling." },
+        { id: "redis",   title: "ElastiCache Redis", sub: "limit · cache · pub/sub", layer: "data",      col: 2, row: 2, desc: "Sessions, RPM/TPM token-bucket counters, hot-thread cache, idempotency keys, the prompt-cache routing map, and pub/sub channels that fan streamed tokens back to the client." },
+        { id: "aurora",  title: "Aurora PostgreSQL", sub: "system of record",        layer: "data",      col: 3, row: 2, desc: "Durable, Multi-AZ source of truth for users, threads, messages and usage; read replicas for the history hot path." },
+        { id: "dlq",     title: "SQS DLQ",           sub: "dead-letter queue",       layer: "messaging", col: 4, row: 2, desc: "Dead-letter queue. After maxReceiveCount failed deliveries a job lands here instead of looping forever and blocking the queue. Alarm on depth; fix and redrive." },
+        { id: "oss",     title: "OpenSearch",        sub: "vector / pgvector",       layer: "data",      col: 5, row: 2, desc: "Vector store for retrieval, memory and semantic search (Amazon OpenSearch k-NN, or pgvector inside Aurora)." },
+        { id: "s3",      title: "Amazon S3",         sub: "blobs · exports",         layer: "data",      col: 6, row: 2, desc: "Attachments, large message blobs and exports. The database stores an S3 pointer, not the bytes." },
+      ],
+      edges: [
+        { from: "client", to: "cf" }, { from: "cf", to: "alb" }, { from: "alb", to: "app" },
+        { from: "app", to: "sqs" }, { from: "sqs", to: "infgw" }, { from: "infgw", to: "model" },
+        { from: "route53", to: "cf", kind: "data" }, { from: "app", to: "redis", kind: "data" },
+        { from: "app", to: "aurora", kind: "data" }, { from: "app", to: "s3", kind: "data" },
+        { from: "app", to: "oss", kind: "data" }, { from: "sqs", to: "dlq", kind: "data" },
+        { from: "model", to: "redis", kind: "data" }, { from: "app", to: "cw", kind: "data" },
+      ],
+      path: [
+        { node: "client",  label: "POST /v1/threads/{id}/messages with stream:true" },
+        { node: "cf",      label: "CloudFront + WAF/Shield: TLS, cache, drop attacks" },
+        { node: "alb",     label: "ALB routes to a healthy app task, holds the SSE connection" },
+        { node: "app",     label: "auth + rate-limit (ElastiCache), load thread (Aurora), enqueue (SQS)" },
+        { node: "sqs",     label: "SQS queues the inference job; DLQ catches poison messages" },
+        { node: "infgw",   label: "inference gateway consumes it: admission + continuous batching" },
+        { node: "model",   label: "GPU server (vLLM): prefill + decode, KV cache in HBM" },
+        { node: "app",     label: "tokens stream back via ElastiCache pub/sub → ALB → SSE" },
+      ],
+    },
   };
 
   function architecture(el) {

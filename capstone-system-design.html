@@ -131,6 +131,103 @@ stream:&lt;reqid&gt;           → PUBLISH / SUBSCRIBE channel     <span class="
         ]'
         data-cap="The platform overhead (network, auth, DB, queue) is a sliver. <strong>Prefill</strong> is what a prompt-cache hit collapses &mdash; the warm bar skips re-prefilling the stable prefix, so TTFT drops sharply. <strong>Decode</strong> barely moves: every output token is still its own sequential forward pass. To cut total latency you shorten the output or route to a faster tier; to cut TTFT you cache the prefix."></div>
 
+      <h2>Part A&frac12; &middot; The same system on AWS</h2>
+      <p>The boxes above are roles; here is one concrete way to build them on AWS. Same shapes, named services. Click a component, or animate the request again to watch it cross the cloud.</p>
+
+      <div class="viz" data-viz="architecture" data-arch="aws"
+        data-title="AWS reference architecture (interactive)"
+        data-sub="Solid arrows = request path, dashed = data access. Click any service for what it is and why it is there; press Animate a request to follow one message across the VPC."
+        data-cap="Cheap rejections happen at the edge (CloudFront + WAF); durable work is decoupled by SQS so a GPU failure just re-queues; the expensive prefill + decode happens on the GPU fleet; tokens stream back through ElastiCache pub/sub and the ALB as SSE."></div>
+
+      <h3>Component &rarr; AWS service</h3>
+      <table>
+        <thead><tr><th>Role (Part A)</th><th>AWS service</th><th>Why</th></tr></thead>
+        <tbody>
+          <tr><td>Edge / CDN / WAF</td><td><strong>Route 53</strong> + <strong>CloudFront</strong> + <strong>AWS WAF</strong> / <strong>Shield</strong></td><td>DNS &amp; geo routing, static caching at the POP, TLS, and dropping attacks before the VPC.</td></tr>
+          <tr><td>Load balancer</td><td><strong>Application Load Balancer</strong> (ALB)</td><td>Holds the long-lived <code>text/event-stream</code> connection. Prefer ALB over API Gateway for SSE &mdash; API Gateway caps integration timeouts (~30s) and is awkward for token streaming.</td></tr>
+          <tr><td>App services (stateless)</td><td><strong>ECS Fargate</strong> or <strong>EKS</strong></td><td>Conversation, orchestration, safety, billing as containers; scale out behind the ALB, lose any task without losing data.</td></tr>
+          <tr><td>Sessions · rate limits · hot cache · pub/sub</td><td><strong>ElastiCache for Redis</strong> (cluster mode, Multi-AZ)</td><td>Sub-ms reads in-VPC for auth, token-bucket counters, idempotency, the prompt-cache routing map, and streaming fan-out.</td></tr>
+          <tr><td>System of record</td><td><strong>Aurora PostgreSQL</strong> (or RDS)</td><td>Durable, Multi-AZ, transactional. Read replicas serve the history hot path.</td></tr>
+          <tr><td>Job queue + dead letters</td><td><strong>Amazon SQS</strong> + <strong>SQS DLQ</strong></td><td>Decouple the fast API from slow GPU work, absorb bursts, retry safely, and quarantine poison messages.</td></tr>
+          <tr><td>Blobs &amp; exports</td><td><strong>Amazon S3</strong></td><td>Attachments and large blobs; the DB stores a pointer, not the bytes.</td></tr>
+          <tr><td>Vector / retrieval</td><td><strong>OpenSearch</strong> k-NN or <strong>pgvector</strong> in Aurora</td><td>Semantic search, RAG, long-term memory.</td></tr>
+          <tr><td>Inference fleet</td><td><strong>EKS on GPU EC2</strong> (p5 / p4d / g5) running vLLM / TGI</td><td>Prefill + decode with continuous batching and paged KV cache; autoscaled by Karpenter on queue depth + p99 TTFT.</td></tr>
+          <tr><td>Analytics / warehouse</td><td><strong>Kinesis Firehose</strong> &rarr; <strong>S3</strong> &rarr; <strong>Athena</strong> / <strong>Redshift</strong></td><td>Events &amp; evals, off the request path.</td></tr>
+          <tr><td>Observability</td><td><strong>CloudWatch</strong> + <strong>X-Ray</strong> (or AMP/AMG + OTel)</td><td>Metrics, traces, logs; alarms drive autoscaling.</td></tr>
+          <tr><td>Secrets &amp; encryption</td><td><strong>Secrets Manager</strong> / <strong>SSM</strong> + <strong>KMS</strong></td><td>API keys, DB creds; KMS for at-rest encryption everywhere.</td></tr>
+        </tbody>
+      </table>
+
+      <h3>The queue and its dead-letter queue (SQS)</h3>
+      <p>Generation takes seconds and runs on scarce GPUs; the HTTP request must return a stream in milliseconds. You cannot couple them directly, or a traffic spike either melts the GPUs or 503s the API. So the app <strong>enqueues an inference job</strong> and the GPU workers <strong>pull at their own pace</strong>. The queue absorbs bursts, provides natural backpressure, and lets you autoscale workers on queue depth.</p>
+      <ul>
+        <li><strong>Standard vs FIFO.</strong> Use a <strong>FIFO</strong> queue with <code>MessageGroupId = threadId</code> when messages within a thread must be processed in order (and you want near-exactly-once); use <strong>standard</strong> for max throughput when ordering is handled elsewhere.</li>
+        <li><strong>Visibility timeout.</strong> When a worker receives a job, SQS hides it for the visibility timeout. If the worker dies, the job reappears and another worker takes it. Long generations must either set a long timeout or <strong>heartbeat</strong> with <code>ChangeMessageVisibility</code> &mdash; otherwise the job is redelivered <em>while still running</em> and you generate twice.</li>
+        <li><strong>The DLQ.</strong> A <strong>poison message</strong> (one that always fails &mdash; malformed job, a prompt that trips a bug) would otherwise be received, fail, reappear, and loop forever, starving the queue. A <strong>redrive policy</strong> moves it to a <strong>dead-letter queue</strong> after <code>maxReceiveCount</code> failed receives. You alarm on DLQ depth, inspect, fix, and <strong>redrive</strong> the messages back.</li>
+        <li><strong>Scaling consumers</strong> on <code>ApproximateNumberOfMessagesVisible</code> (queue depth) via Application Auto Scaling / Karpenter; use <strong>long polling</strong> (<code>WaitTimeSeconds: 20</code>) to cut empty receives.</li>
+      </ul>
+      <pre><code><span class="tok-com"># SQS main queue with a redrive policy → DLQ</span>
+{
+  <span class="tok-str">"QueueName"</span>: <span class="tok-str">"inference-jobs.fifo"</span>,
+  <span class="tok-str">"FifoQueue"</span>: <span class="tok-key">true</span>,
+  <span class="tok-str">"VisibilityTimeout"</span>: <span class="tok-num">120</span>,        <span class="tok-com"># &gt; max time to generate one reply</span>
+  <span class="tok-str">"ReceiveMessageWaitTimeSeconds"</span>: <span class="tok-num">20</span>,  <span class="tok-com"># long polling</span>
+  <span class="tok-str">"RedrivePolicy"</span>: {
+    <span class="tok-str">"deadLetterTargetArn"</span>: <span class="tok-str">"arn:aws:sqs:...:inference-jobs-dlq.fifo"</span>,
+    <span class="tok-str">"maxReceiveCount"</span>: <span class="tok-num">5</span>           <span class="tok-com"># 5 failures → DLQ, no infinite loop</span>
+  }
+}</code></pre>
+      <div class="callout key">
+        <span class="label">Why a DLQ is non-negotiable</span>
+        <p>Without it, a single un-processable job re-enters the queue forever, burns worker time, and can wedge the whole pipeline behind it. The DLQ turns &ldquo;poison message&rdquo; from an outage into an alarm you triage at leisure.</p>
+      </div>
+
+      <h3>Redis for RPM &amp; token (TPM) rate limiting</h3>
+      <p>LLM load scales with <em>tokens</em>, not request count &mdash; a 1-request prompt of 200K tokens costs far more than 100 tiny ones. So the gateway enforces a <strong>token bucket per user/tenant on two dimensions: requests-per-minute (RPM) and tokens-per-minute (TPM)</strong>. Counters must be <strong>atomic</strong> (many gateway tasks hit the same key concurrently), which is exactly what a single-threaded <strong>ElastiCache Redis</strong> with a Lua script gives you.</p>
+      <pre><code><span class="tok-com"># Atomic token-bucket check in Redis (Lua) — one round trip, no races</span>
+<span class="tok-com"># KEYS[1]=bucket key   ARGV: rate, burst, now, cost</span>
+<span class="tok-key">local</span> b = redis.call(<span class="tok-str">'HMGET'</span>, KEYS[1], <span class="tok-str">'tokens'</span>, <span class="tok-str">'ts'</span>)
+<span class="tok-key">local</span> tokens = tonumber(b[<span class="tok-num">1</span>]) <span class="tok-key">or</span> tonumber(ARGV[<span class="tok-num">2</span>])   <span class="tok-com">-- start full (burst)</span>
+<span class="tok-key">local</span> ts = tonumber(b[<span class="tok-num">2</span>]) <span class="tok-key">or</span> tonumber(ARGV[<span class="tok-num">3</span>])
+tokens = math.min(tonumber(ARGV[<span class="tok-num">2</span>]), tokens + (ARGV[<span class="tok-num">3</span>]-ts)*ARGV[<span class="tok-num">1</span>])  <span class="tok-com">-- refill</span>
+<span class="tok-key">if</span> tokens &lt; tonumber(ARGV[<span class="tok-num">4</span>]) <span class="tok-key">then return</span> <span class="tok-num">0</span> <span class="tok-key">end</span>          <span class="tok-com">-- over limit → 429</span>
+redis.call(<span class="tok-str">'HMSET'</span>, KEYS[1], <span class="tok-str">'tokens'</span>, tokens - ARGV[<span class="tok-num">4</span>], <span class="tok-str">'ts'</span>, ARGV[<span class="tok-num">3</span>])
+redis.call(<span class="tok-str">'EXPIRE'</span>, KEYS[1], <span class="tok-num">120</span>)
+<span class="tok-key">return</span> <span class="tok-num">1</span></code></pre>
+      <pre><code><span class="tok-com"># Example keys (per user/tenant)</span>
+ratelimit:user_42:rpm        <span class="tok-com"># requests/min bucket</span>
+ratelimit:user_42:tpm        <span class="tok-com"># tokens/min bucket  (cost = estimated input+output tokens)</span>
+session:&lt;token&gt;              <span class="tok-com"># auth lookup</span>
+idem:&lt;key&gt;                   <span class="tok-com"># SETNX for idempotency</span>
+thread:&lt;id&gt;:cache            <span class="tok-com"># hot history</span>
+stream:&lt;reqid&gt;               <span class="tok-com"># PUBLISH tokens here; the SSE handler SUBSCRIBEs</span></code></pre>
+      <p>The subtlety for TPM: you don&rsquo;t know the exact output length up front, so you <strong>reserve</strong> an estimate (input tokens + a max-output guess) at admission, then <strong>reconcile</strong> the real usage after generation &mdash; refunding or charging the difference back to the bucket. (Note: SQS is the durable <em>job</em> queue; Redis pub/sub is the ephemeral <em>token-stream</em> channel. Don&rsquo;t conflate them.)</p>
+
+      <h3>Where does the KV cache live? (the part everyone gets wrong)</h3>
+      <p>Instinct says &ldquo;put the KV cache in Redis.&rdquo; <strong>You don&rsquo;t.</strong> The KV cache is many <em>gigabytes</em> of per-request GPU tensors that are read at HBM bandwidth on <em>every</em> decode step &mdash; round-tripping that to a network cache would be orders of magnitude too slow. The KV cache lives <strong>next to the GPU</strong>, in a tier of progressively colder, cheaper memory:</p>
+      <table>
+        <thead><tr><th>Tier</th><th>Where</th><th>Holds</th><th>Managed by</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Hot</strong></td><td>GPU <strong>HBM</strong></td><td>KV for every <em>currently running</em> request</td><td>The engine&rsquo;s <strong>PagedAttention</strong> (vLLM): fixed-size KV <em>blocks</em>, managed like OS pages &mdash; high utilization + within-node prefix sharing.</td></tr>
+          <tr><td><strong>Warm</strong></td><td>Host <strong>CPU RAM</strong> / local <strong>NVMe</strong> (instance store)</td><td>Cold KV blocks <strong>offloaded</strong> to free HBM, and recently-used prefixes kept for reuse</td><td>KV-cache offloading (vLLM CPU offload); swap back on a hit.</td></tr>
+          <tr><td><strong>Shared (advanced)</strong></td><td>Distributed KV store over <strong>NVMe / RDMA</strong> (e.g. LMCache)</td><td>Prefix KV reusable <em>across</em> nodes</td><td>Trades network bandwidth for prefill savings; transport is RDMA/NVMe, <em>not</em> vanilla Redis &mdash; the tensors are too big.</td></tr>
+        </tbody>
+      </table>
+      <p>So how does <strong>prompt caching</strong> (reusing a stable prefix across requests) actually work in this topology? Two pieces:</p>
+      <ol>
+        <li><strong>The engine caches the prefix KV.</strong> vLLM <em>prefix caching</em> / SGLang <em>RadixAttention</em> keep the computed KV for a shared prefix (system prompt + early history) resident, so a repeat request skips re-prefilling it.</li>
+        <li><strong>You must route the repeat request to the same replica that holds it.</strong> A prefix cached on server A is useless if the next request lands on server B. So the inference gateway does <strong>prefix-aware routing</strong>: hash the stable prefix and consistent-hash it to a replica (sticky by prefix). <strong>This</strong> is what ElastiCache stores &mdash; a small <code>prefixhash &rarr; replica</code> map and prompt-cache <em>metadata</em>. The multi-GB KV bytes never touch Redis; only the routing pointer does.</li>
+      </ol>
+      <div class="callout gotcha">
+        <span class="label">The capacity equation that decides everything</span>
+        <p>Per GPU: <code>HBM = model weights + Σ(KV cache of every concurrent request)</code>. From P1.5, KV bytes ≈ <code>2 · layers · kv_heads · head_dim · seq · 2B</code> per request. The KV term is what caps your <strong>batch size</strong> (concurrent requests) and therefore throughput &mdash; which is exactly why paging, offloading, and GQA exist. Conversation <em>text</em> lives in Aurora; the <em>KV tensors</em> derived from it live on the GPU and are rebuilt or prefix-reused, never stored in your databases.</p>
+      </div>
+
+      <div class="callout key">
+        <span class="label">Reliability, the AWS way</span>
+        <p>Stateful tiers (Aurora, ElastiCache) run <strong>Multi-AZ</strong>. Stateless app tasks can ride <strong>Spot</strong>; in-flight GPU requests should not (an eviction loses the KV cache). SQS decouples everything: a model-server crash just lets the job&rsquo;s visibility timeout lapse and another worker retries &mdash; with the DLQ as the backstop. Autoscale the GPU fleet on <strong>queue depth + p99 TTFT</strong>, not CPU.</p>
+      </div>
+
       <h2>Part B &middot; Trace one request: &ldquo;send a message in a thread&rdquo;</h2>
       <p>Now the payoff: one request, numbered hop by hop, from the browser to the attention math and back. Follow the stepper, then read the concrete examples under each stage.</p>
 
